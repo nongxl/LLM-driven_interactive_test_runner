@@ -1,0 +1,263 @@
+你是一名资深自动化测试框架工程师。请为当前项目实现一个 **AI 自动化测试的验证系统（Verification Engine）**，并采用“双数据流架构”，使系统同时具备低 token 成本与高验证可靠性。
+
+技术栈要求：使用 Python + Playwright。
+
+---
+
+# 一、核心设计（必须遵守）
+
+系统必须采用“双数据流”：
+
+1 决策数据流（低成本）
+
+* 来源：agent-browser snapshot（accessibility tree）
+* 用途：提供给 AI 做操作决策（点击、输入等）
+
+2 验证数据流（高可靠）
+
+* 来源：Playwright page 对象（真实 DOM / 浏览器状态）
+* 用途：用于断言（assertion），判断操作是否成功
+
+原则：
+
+* snapshot 只用于“看”（AI 决策）
+* DOM / page 只用于“判定”（verification）
+* 不允许用 snapshot 做核心验证逻辑
+
+---
+
+# 二、Trace Schema 扩展
+
+在 trace 中增加：
+
+## expected
+
+{
+"expected": {
+"type": "url_contains",
+"value": "/dashboard"
+}
+}
+
+支持类型：
+
+* url_contains
+* url_equals
+* text_present
+* element_visible
+* element_not_visible
+* element_value_equals
+
+---
+
+## verification
+
+{
+"verification": {
+"method": "rule" | "ai" | "rule+ai",
+"source": "dom" | "snapshot",
+"result": "pass" | "fail",
+"confidence": 0.0-1.0,
+"reason": "string",
+"evidence": {}
+}
+}
+
+要求：
+
+* 默认 source = dom
+* 必须包含 reason
+* evidence 用于记录关键验证数据（如 URL、文本）
+
+---
+
+# 三、实现 verification_engine
+
+实现模块：
+
+core/verification_engine.py
+
+提供统一接口：
+
+def verify(page, before_snapshot, after_snapshot, expected) -> dict
+
+参数说明：
+
+* page: Playwright page 对象（用于 DOM 验证）
+* before_snapshot: agent-browser snapshot（可选）
+* after_snapshot: agent-browser snapshot（可选）
+* expected: 结构化断言
+
+返回：
+
+{
+"method": "...",
+"source": "...",
+"result": "pass/fail",
+"confidence": 0-1,
+"reason": "...",
+"evidence": {}
+}
+
+---
+
+# 四、Rule-based Verification（优先实现）
+
+所有规则必须基于 Playwright page（DOM）
+
+实现以下断言：
+
+## 1 url_contains
+
+page.url 包含 expected.value
+
+---
+
+## 2 url_equals
+
+完全匹配
+
+---
+
+## 3 text_present
+
+await page.locator("body").inner_text()
+
+判断是否包含文本
+
+---
+
+## 4 element_visible
+
+await page.get_by_role(...) 或 locator 判断
+
+---
+
+## 5 element_not_visible
+
+相反判断
+
+---
+
+## 6 element_value_equals
+
+读取 input value 并比对
+
+---
+
+所有 rule-based 验证：
+
+* method = "rule"
+* source = "dom"
+* confidence = 1.0
+
+---
+
+# 五、AI Verification（fallback）
+
+仅在以下情况使用：
+
+* rule 无法判断
+* expected 类型未知
+* UI 复杂（无法结构化）
+
+输入：
+
+* before_snapshot
+* after_snapshot
+* expected
+
+输出：
+
+{
+"result": "pass/fail",
+"confidence": 0-1,
+"reason": "..."
+}
+
+此时：
+
+* method = "ai"
+* source = "snapshot"
+
+---
+
+# 六、执行流程（必须实现）
+
+在 runner 中：
+
+1 执行 action
+2 等待页面稳定（必须实现）：
+
+* await page.wait_for_load_state("networkidle")
+  或 configurable sleep（默认 1 秒）
+
+3 获取 after_snapshot
+4 调用 verification_engine.verify(...)
+5 将结果写入 trace
+
+---
+
+# 七、Goal State（全局验证）
+
+支持 test_spec：
+
+goal:
+
+* url_contains: /dashboard
+* text_present: Welcome
+
+测试结束后：
+
+* 使用 verification_engine 执行最终验证
+* 写入 trace.result
+
+---
+
+# 八、Trace Recorder 集成
+
+每一步记录：
+
+* expected
+* verification
+
+最终 trace.result：
+
+* status = pass/fail
+* confidence = 所有关键步骤平均值 或 goal 判断
+
+---
+
+
+# 九、实现要求
+
+1 verification_engine 必须完全独立（不可耦合 agent-browser）
+2 所有验证优先使用 DOM（Playwright）
+3 AI 验证为 fallback，尽量减少调用
+4 所有结果必须可解释（reason 字段）
+5 保证 trace 可回放
+
+---
+
+# 十、输出内容
+
+请输出：
+
+1 verification_engine.py 完整实现
+2 示例 trace（包含 expected + verification）
+3 ai_runner 中如何调用 verification 的示例
+4 replay_runner 如何复用 verification 的示例
+5 一个简单 test_spec 示例（包含 goal），可修改当前的login.yaml加上verification部分
+
+---
+
+# 十一、设计目标
+
+构建一个系统，使：
+
+* AI 负责“做什么”（决策）
+* 代码负责“是否成功”（验证）
+
+从而实现：
+
+低 token 成本 + 高测试可靠性 + 可回放测试路径

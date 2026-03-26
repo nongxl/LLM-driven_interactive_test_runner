@@ -1,0 +1,18 @@
+name: "框架通用性测试"
+url: "https://www.baidu.com/"
+goal:
+  url_contains: "https://www.baidu.com/"
+
+steps:
+  - instruction: "打开百度"
+    expected:
+      - type: "url_contains"
+        value: "https://www.baidu.com/"
+      - type: "text_present"
+        value: "百度"
+  - instruction: "输入搜索关键词【IP】，点击搜索按钮，等待页面跳转"
+    expected:
+      - type: "text_present"
+        value: "IP"
+      - type: "text_present"
+        value: "IP地址" 

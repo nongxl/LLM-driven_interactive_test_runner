@@ -1,0 +1,7 @@
+{
+    "ignoreHttpsErrors": true,
+    "headed": true,
+    "args": "--start-maximized,--disable-infobars,--disable-blink-features=AutomationControlled",
+    "session-name": "login_session",
+    "viewport": null
+}

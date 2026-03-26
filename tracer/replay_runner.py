@@ -1,0 +1,356 @@
+import argparse
+import asyncio
+import json
+import os
+import sys
+import time
+import shutil
+import subprocess
+from datetime import datetime
+from typing import Optional, List, Dict, Any
+
+# 把当前路径的外层加到 sys.path 用于之后真机引入模块
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from tracer.schema import Trace
+from core.action_executor import execute
+from core.snapshot_manager import get_snapshot
+from core.utils import cleanup_browser_env, resolve_trace_path, strip_ansi, S_OK, S_ERR, S_WARN, S_INFO
+
+# 全局日志函数句柄，由 main 初始化
+_log_func = print
+
+def log_it(msg, end="\n", flush=True):
+    _log_func(msg, end=end, flush=flush)
+
+
+async def find_element_by_semantic_locator(locator: Any) -> Optional[str]:
+    """通过实时快照 JSON 属性匹配元素，取代模糊的语义猜测"""
+    if not locator or (not getattr(locator, 'role', None) and not getattr(locator, 'name', None)):
+        return None
+
+    role = (getattr(locator, 'role', '') or '') if locator else ''
+    name = (getattr(locator, 'name', '') or '') if locator else ''
+    
+    profile_name = os.getenv("AGENT_BROWSER_PROFILE", "browser_profile_replay")
+    profile_path = os.path.join(os.getcwd(), 'artifacts', profile_name)
+    
+    if not role and not name:
+        return None
+
+    log_it(f"  [Auto-Healing] 正在通过属性寻找元素: role='{role}', name='{name}'...")
+    try:
+        # 复用 get_snapshot 异步函数，它内置了重试和超时逻辑
+        snapshot_res = await get_snapshot(logger=log_it)
+        raw_json = snapshot_res.get('raw', '{}')
+        if not raw_json: return None
+        
+        data = json.loads(raw_json)
+        # 从 refs 字典中查找匹配项
+        refs = data.get("data", {}).get("refs", {})
+        if not refs: return None
+        
+        # 1. 尝试完全匹配
+        for eid, info in refs.items():
+            if info.get('role') == role and info.get('name') == name:
+                log_it(f"  [Auto-Healing] 属性完全匹配成功: {eid}")
+                return eid
+        
+        # 2. 尝试清洗后精确匹配 (处理带动态编号的文本)
+        import re
+        def clean_name(n):
+            if not n: return ""
+            # 移除开头的长串数字（通常是动态生成的 ID 或序号）
+            return re.sub(r'^\d{5,}', '', str(n)).strip()
+            
+        clean_target_name = clean_name(name)
+        if not clean_target_name: return None
+        
+        candidates = []
+        for eid, info in refs.items():
+            curr_name = info.get('name') or ''
+            clean_curr_name = clean_name(curr_name)
+            
+            if info.get('role') == role:
+                # 记录所有角色匹配的候选项，用于后续调试
+                if clean_target_name == clean_curr_name:
+                    log_it(f"  [Auto-Healing] 属性【清洗后精确匹配】成功: {eid} ({curr_name})")
+                    return eid
+                if clean_curr_name and (clean_target_name in clean_curr_name or clean_curr_name in clean_target_name):
+                    candidates.append((eid, curr_name))
+        
+        # 3. 如果没有精确匹配，尝试从候选人中找最像的
+        if candidates:
+            # 简单取第一个，但在日志里记录
+            eid, c_name = candidates[0]
+            log_it(f"  [Auto-Healing] 属性【清洗后模糊匹配】成功 ({clean_target_name} ~ {c_name}): {eid}")
+            return eid
+
+    except Exception as e:
+        log_it(f"  [Auto-Healing] 匹配异常: {e}")
+    return None
+
+async def run_replay(trace_file: str, strict: bool = False, step_timeout: int = 10) -> dict:
+    """
+    回放指定的 Trace 文件并返回结构化结果。
+    :param trace_file: Trace JSON 文件路径
+    :param strict: 严格模式，任何步骤失败立即停止
+    :param step_timeout: 每一步的最大超时时间（秒）
+    """
+    start_time = time.time()
+    result_summary = {
+        "trace_file": trace_file,
+        "status": "pass",
+        "steps_completed": 0,
+        "total_steps": 0,
+        "error": None,
+        "duration": 0,
+        "step_details": []
+    }
+
+    # 路径解析优化
+    resolved_path = resolve_trace_path(trace_file)
+    if not os.path.exists(resolved_path):
+        result_summary["status"] = "fail"
+        result_summary["error"] = f"Trace file '{trace_file}' (resolved as '{resolved_path}') not found."
+        return result_summary
+    
+    trace_file = resolved_path # 使用解析后的路径
+
+    try:
+        with open(trace_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        trace = Trace.model_validate(data)
+        result_summary["total_steps"] = len(trace.steps)
+        
+        log_it(f"\n--- 正在回放 Trace: {trace.metadata.trace_id} ---")
+        log_it(f" [Trace File] {trace_file}")
+        
+        for step in trace.steps:
+            step_start = time.time()
+            step_info = {"step_id": step.step_id, "instruction": step.instruction, "status": "pass", "error": None}
+            log_it(f"[Step {step.step_id}] {step.instruction}")
+            
+            actions_to_run = getattr(step, 'sub_actions', []) if getattr(step, 'sub_actions', []) else [step]
+            
+            for sub_idx, sub in enumerate(actions_to_run):
+                # 如果这个子动作在录制时就是执行失败的（比如点错了），不要在回放时傻傻重复错误
+                if getattr(sub, 'execution', None) and sub.execution.status != "success":
+                    log_it(f"  [Skip] 跳过录制时失败的动作 (Sub-Action {sub_idx+1})")
+                    continue
+                    
+                try:
+                    raw_action = getattr(sub.decision, 'raw_action', None)
+                    if raw_action:
+                        log_it(f"  [Sub-Action {sub_idx+1}/{len(actions_to_run)}] {json.dumps(raw_action, ensure_ascii=False)}")
+                    else:
+                        log_it(f"  [Sub-Action {sub_idx+1}/{len(actions_to_run)}] {sub.decision.action}")
+
+                    action_name = sub.decision.action
+                    if action_name in ("navigate", "open"): 
+                        action_name = "goto"
+                        
+                    target_val = ""
+                    if action_name == "goto":
+                        target_val = str(sub.decision.value or "")
+                    elif sub.decision.target and sub.decision.target.snapshot_id:
+                        target_val = sub.decision.target.snapshot_id
+                        # [Optimization] 为了降低 Daemon 压力，取消执行前的 Proactive 映射
+                        # 只有在执行失败触发自愈时才进行动态查找
+                    
+                    # 执行动作
+                    exec_dict = {
+                        "action": action_name,
+                        "target": target_val,
+                        "value": sub.decision.value or ""
+                    }
+                    
+                    # 健壮性改进：加入针对 agent-browser 进程崩溃/端口冲突的自动重试
+                    for _try in range(3):
+                        res = await execute(exec_dict)
+                        if "os error 10048" in res or "Failed to bind TCP" in res.replace(" ", ""):
+                            log_it(f"  [WARN] 进程绑死 (端口冲突)，等待 1s 后重试执行 ({_try + 1}/3)...")
+                            await asyncio.sleep(1)
+                            continue
+                        break
+                    
+                    # 判定执行是否失败（能否触发自愈）
+                    def is_really_failed(r):
+                        # 去掉已知无关警告的干扰
+                        r_clean = r.replace("ignore-https-errors", "")
+                        low_r = r_clean.lower()
+                        return "error" in low_r or S_ERR in r_clean or "fail" in low_r or "unknown" in low_r \
+                               or "not found" in low_r or "could not locate" in low_r or "timeout" in low_r \
+                               or "out of range" in low_r or "code 4294967295" in low_r
+
+                    # 健壮性改进：初次执行失败（或由于 Daemon 启动瞬间冲突），尝试重试执行
+                    if is_really_failed(res):
+                        # 特殊放行：如果是 tab_close 且报错 index out of range，可能页签已经关闭，不应卡死
+                        if action_name == "tab_close" and "out of range" in res.lower():
+                            log_it(f"  {S_WARN} 页签已不存在，忽略关闭错误")
+                            res = f"{S_OK} Tab already gone"
+                        else:
+                            log_it(f"  {S_WARN} 执行出现异常 ({res.strip()})，等待 2s 后尝试重试...")
+                            await asyncio.sleep(2.0)
+                            res = await execute(exec_dict)
+                        
+                        # 如果重试依然失败，且有语义定位器，尝试属性重映射自愈
+                        if is_really_failed(res):
+                            log_it(f"  {S_WARN} 重试失败，正在尝试【实时属性重映射】自愈...")
+                            locator = None
+                            if sub.decision.target and sub.decision.target.semantic_locator:
+                                locator = sub.decision.target.semantic_locator
+                            
+                            he_eid = await find_element_by_semantic_locator(locator)
+                            if he_eid:
+                                log_it(f"  [Auto-Healing] 修正 Target: {target_val} -> {he_eid}")
+                                res = await execute({"action": action_name, "target": he_eid, "value": sub.decision.value or ""})
+                            else:
+                                log_it(f"  {S_WARN} 无法通过属性定位元素，尝试强制刷新快照重试...")
+                                await asyncio.sleep(1.0)
+                                await execute({"action": "screenshot", "target": f"artifacts/reports/screenshots/retry_{sub_idx}.png"})
+                                res = await execute(exec_dict)
+                    
+                    log_it(f"  -> 执行: {res}")
+                    
+                    # 健壮性改进：如果刚才执行的是 goto，强制触发一次快照，确保后端加载了元素 ID
+                    if action_name == "goto":
+                        try:
+                            # 显式等待以确保 CDP 识别到新 URL
+                            log_it("  [Sync] 正在同步页面状态...")
+                            await asyncio.sleep(3.0) 
+                            # 通过截图动作强制触发验证引擎的 Page 刷新与同步
+                            await execute({"action": "screenshot", "target": "artifacts/reports/screenshots/sync_after_goto.png"})
+                        except: pass
+
+                    if action_name == "goto": await asyncio.sleep(1.0)
+                    elif action_name == "click": await asyncio.sleep(2.0)
+                    else: await asyncio.sleep(1.0)
+
+                except Exception as e:
+                    log_it(f"  {S_ERR} 错误: {e}")
+                    step_info["status"] = "fail"
+                    step_info["error"] = str(e)
+                    break
+            
+            # 如果中间动作没有 fail，则在动作全部完成后执行此统一的大步骤验证
+            if step_info["status"] != "fail" and getattr(step, "expected", None):
+                from core.verification_engine import verify, get_playwright_page
+                log_it(f"  [Verify] 正在执行大步骤最终验证...", end="", flush=True)
+                page = await get_playwright_page()
+                if page:
+                    if isinstance(step.expected, list):
+                        expected_data = [e.model_dump() for e in step.expected]
+                    elif step.expected:
+                        expected_data = step.expected.model_dump()
+                    else:
+                        expected_data = None
+                    
+                    v_res = await verify(page, expected_data)
+                    if v_res['result'] == 'pass':
+                        log_it(f" {S_OK} {v_res['reason']}")
+                    else:
+                        # 对于兼容老 Trace: 老 Trace 中本身期望失败的，我们依然放过
+                        expected_to_fail = getattr(step, "verification", None) and step.verification.result == "fail"
+                        if expected_to_fail and not getattr(step, 'sub_actions', []):
+                            log_it(f" {S_WARN} {v_res['reason']} (此步骤在旧版 Trace 中也是失败的，兼容放行)")
+                        else:
+                            log_it(f" {S_ERR} {v_res['reason']}")
+                            step_info["status"] = "fail"
+                            step_info["error"] = v_res['reason']
+                else:
+                    log_it(f" {S_WARN} 无法获取 Page，跳过验证")
+
+            result_summary["step_details"].append(step_info)
+            if step_info["status"] == "fail":
+                result_summary["status"] = "fail"
+                if strict:
+                    result_summary["error"] = f"Strict mode: Stopped at step {step.step_id} - {step_info['error']}"
+                    break
+            
+            result_summary["steps_completed"] += 1
+
+    except Exception as e:
+        result_summary["status"] = "fail"
+        result_summary["error"] = f"Fatal replay error: {str(e)}"
+    finally:
+        from core.verification_engine import close_verification_engine
+        await close_verification_engine()
+        result_summary["duration"] = round(time.time() - start_time, 2)
+        
+    return result_summary
+
+async def main():
+    parser = argparse.ArgumentParser(description="Replay a recorded trace file.")
+    parser.add_argument("trace_file", type=str, help="Path to the JSON trace file")
+    parser.add_argument("--strict", action="store_true", help="Stop on first failure")
+    parser.add_argument("--no-clean", action="store_true", help="Do not clean browser environment before replay")
+    args = parser.parse_args()
+
+    # 初始化日志记录器
+    log_filename = f"replay_{datetime.now().strftime('%m%d_%H%M%S')}.log"
+    log_dir = os.path.join('artifacts', 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    full_log_path = os.path.join(log_dir, log_filename)
+
+    def replay_log(msg, end="\n", flush=False):
+        try:
+            # 终端显示保留原样（如果支持颜色），但写入文件前必须过滤
+            msg_str = str(msg)
+            print(msg_str, end=end, flush=flush)
+            
+            clean_msg = strip_ansi(msg_str)
+            with open(full_log_path, 'a', encoding='utf-8') as f:
+                f.write(clean_msg + end)
+        except Exception:
+            pass
+
+    global _log_func
+    _log_func = replay_log
+
+    log_it(f"回放日志已开启: {full_log_path}")
+
+    if not args.no_clean:
+        cleanup_browser_env(profile_name="browser_profile_replay", logger=log_it)
+        log_it(" [Wait] 等待系统完全释放资源 (10s)...")
+        await asyncio.sleep(10)
+
+    # 设置回放专用的环境变量
+    os.environ["AGENT_BROWSER_PORT"] = "3031"
+    os.environ["AGENT_BROWSER_PROFILE"] = "browser_profile_replay"
+
+    result = None
+    try:
+        result = await run_replay(args.trace_file, strict=args.strict)
+        
+        log_it(f"\n{'='*30}")
+        log_it(f"回放完成: {result['status'].upper()}")
+        log_it(f"进度: {result['steps_completed']}/{result['total_steps']}")
+        log_it(f"耗时: {result['duration']}s")
+        if result['error']:
+            log_it(f"错误: {result['error']}")
+        log_it(f"{'='*30}\n")
+        
+    finally:
+        # 环境清理 (无论成功失败或 Ctrl+C 中断)
+        try:
+            cleanup_browser_env(profile_name="browser_profile_replay", logger=log_it)
+        except: pass
+        
+        # 记录结束后，根据最终状态重命名日志文件
+        if result and result.get("status"):
+            try:
+                status_suffix = result["status"]
+                new_log_filename = log_filename.replace(".log", f"_{status_suffix}.log")
+                new_full_log_path = os.path.join(log_dir, new_log_filename)
+                os.rename(full_log_path, new_full_log_path)
+                print(f"日志文件已重命名为: {new_full_log_path}")
+            except Exception as e:
+                print(f"日志重命名失败: {e}")
+
+        if result and result.get("status") == "fail":
+            sys.exit(1)
+
+if __name__ == "__main__":
+    asyncio.run(main())

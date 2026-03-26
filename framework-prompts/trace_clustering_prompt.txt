@@ -1,0 +1,173 @@
+你是一名资深自动化测试架构师。请在当前项目中实现“Trace Clustering System”，用于将探索性测试生成的大量 trace 自动去重，并提取核心测试路径（smoke tests）。
+
+技术栈：Python
+
+---
+
+# 一、目标
+
+实现一个系统：
+
+输入：
+
+* 多条 trace（JSON）
+
+输出：
+
+* 去重后的 clusters
+* 每个 cluster 的代表路径（representative trace）
+* 自动生成 smoke tests
+
+---
+
+# 二、Trace 输入格式
+
+trace 示例：
+
+{
+"trace_id": "...",
+"actions": [
+{"type": "click", "target": "login_button"},
+{"type": "input", "target": "username", "value": "test"},
+{"type": "click", "target": "submit"}
+],
+"result": "pass",
+"confidence": 0.9
+}
+
+---
+
+# 三、模块设计
+
+实现：
+
+core/trace_clusterer.py
+
+提供接口：
+
+cluster_traces(traces: List[dict]) -> dict
+
+返回：
+
+{
+"clusters": [
+{
+"cluster_id": "...",
+"traces": [...],
+"representative": {...}
+}
+]
+}
+
+---
+
+# 四、Trace Normalization
+
+实现函数：
+
+normalize_trace(trace)
+
+要求：
+
+* 只保留 action.type + target（忽略动态值）
+* 去掉无效步骤（如重复 click）
+* 返回标准化 action list
+
+---
+
+# 五、相似度计算（必须实现）
+
+实现：
+
+compute_similarity(trace_a, trace_b)
+
+使用：
+
+LCS（最长公共子序列）
+
+输出：
+
+0 ~ 1
+
+---
+
+# 六、Clustering 算法（必须实现）
+
+使用 Greedy clustering：
+
+for trace in traces:
+找最相似 cluster
+if similarity > threshold（默认 0.7）:
+加入
+else:
+创建新 cluster
+
+---
+
+# 七、Representative Trace 选择
+
+实现规则：
+
+优先级：
+
+1 result == pass
+2 最短 action 数
+3 confidence 高
+
+---
+
+# 八、输出 Smoke Tests
+
+为每个 cluster：
+
+生成：
+
+smoke_tests/<cluster_id>.json
+
+内容：
+
+* representative trace
+* goal（自动推断）
+
+---
+
+# 九、Goal 自动推断（基础版）
+
+根据最后一步：
+
+例如：
+
+* URL 变化 → url_contains
+* 页面文本变化 → text_present
+
+---
+
+# 十、输出内容
+
+请输出：
+
+1 trace_clusterer.py 完整实现
+2 示例输入 traces（至少3条）
+3 clustering 输出结果示例
+4 smoke test 示例文件
+5 每个函数的说明
+
+---
+
+# 十一、设计原则
+
+* 必须可扩展（后续支持 embedding）
+* 必须稳定（相同输入输出一致）
+* 必须可解释（打印 similarity）
+
+---
+
+# 十二、目标效果
+
+系统可以自动：
+
+探索产生 100 条 trace
+→ 聚类
+→ 输出 20 条核心测试路径（smoke tests）
+
+从而减少人工维护测试用例

@@ -1,0 +1,185 @@
+你是一个 AI 编程 Agent，正在一个新的代码仓库中工作。
+
+目标
+构建一个基于 agent-browser 的网页自动化测试项目骨架，用于 AI 辅助开发（vibe coding）。
+
+项目必须满足以下目标：
+
+1. 结构清晰，便于 AI 理解
+2. 减少上下文消耗
+3. 避免重复推理
+4. 避免 AI 陷入循环修改代码
+5. 易于长期维护
+
+技术栈
+
+- Python
+- pytest
+- agent-browser
+
+自动化测试原则
+
+采用适配 agent-browser 的“语义化 Page Object Model”。
+
+重要原则：
+
+不要在代码中存储 CSS selector 或 XPath。
+元素定位应依赖 agent-browser 的 snapshot 机制。
+
+Page Object 只表达页面语义和用户操作，例如：
+
+login(username, password)
+search(keyword)
+submit_order()
+
+不要表达 DOM 结构。
+
+目录结构
+
+在项目根目录创建以下结构：
+
+agents/
+pages/
+flows/
+tests/
+data/
+utils/
+config/
+reports/
+
+各目录用途
+
+agents/
+
+存放 AI 协作相关文档和记忆文件。
+
+需要创建以下文件：
+
+AGENTS.md
+TASKS.md
+MEMORY.md
+PROJECT_STRUCTURE.md
+
+pages/
+
+页面对象（Page Objects）。
+
+每个页面只负责页面级操作。
+
+示例：
+
+login_page.py
+dashboard_page.py
+
+flows/
+
+业务流程封装。
+
+一个 flow 可以组合多个页面操作。
+
+示例：
+
+login_flow.py
+checkout_flow.py
+
+tests/
+
+pytest 测试用例。
+
+测试文件应该调用 flow，而不是直接操作页面。
+
+data/
+
+测试数据（JSON 或 YAML）。
+
+utils/
+
+通用工具，例如：
+
+browser_manager.py
+logger.py
+
+config/
+
+配置文件。
+
+reports/
+
+测试报告和运行产物。
+
+AGENTS.md 内容要求
+
+说明：
+
+1 项目目标
+2 架构原则
+3 AI 编码规则
+4 Agent 工作流程
+
+示例规则：
+
+- 不要在 tests 中写业务逻辑
+- 复杂用户流程必须写在 flows 中
+- 页面操作写在 pages 中
+- 不要存储 CSS selector
+- 元素定位依赖 snapshot 推理
+- 优先使用语义描述
+
+TASKS.md
+
+用于记录当前任务队列。
+
+格式示例：
+
+# Tasks
+
+- [ ] 创建浏览器基础封装
+- [ ] 实现 login_page
+- [ ] 实现 login_flow
+- [ ] 编写 login 测试
+
+AI Agent 每次只选择一个任务。
+
+MEMORY.md
+
+用于记录项目状态。
+
+建议包含：
+
+Implemented
+In Progress
+Pending
+
+PROJECT_STRUCTURE.md
+
+解释项目目录结构以及各目录用途。
+
+实现要求
+
+1 创建所有目录
+2 创建必要的占位 Python 文件
+3 实现最小可运行骨架：
+
+- browser_manager
+- base_page
+- login_page 示例
+- login_flow 示例
+- login_test 示例
+
+要求代码保持简单清晰。
+
+不要实现复杂逻辑。
+
+约束
+
+- 不要反复重构目录
+- 只创建最小可运行骨架
+- 优先保证结构清晰
+- 代码可读性优先
+
+任务完成后：
+
+1 更新 TASKS.md
+2 更新 MEMORY.md
+3 解释每个目录的作用
+4 说明 AI Agent 在该项目中的协作方式

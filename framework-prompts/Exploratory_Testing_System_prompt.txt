@@ -1,0 +1,128 @@
+你是一名资深自动化测试架构师。请在当前项目中实现“探索性测试系统（Exploratory Testing System）”。
+
+技术栈：Python + Playwright + agent-browser
+
+---
+
+# 一、目标
+
+实现一个 exploratory_runner，使系统可以：
+
+* 自动探索网页
+* 自动生成测试路径（trace）
+* 避免重复操作
+* 记录每一步操作和验证结果
+
+---
+
+# 二、核心模块
+
+实现以下模块：
+
+## 1 core/exploration_engine.py
+
+功能：
+
+* 输入：当前 snapshot
+* 输出：下一步 action
+
+必须支持：
+
+* 过滤已执行 action
+* 基于 strategy 选择 action
+
+---
+
+## 2 core/state_memory.py
+
+功能：
+
+维护：
+
+* visited_states
+* visited_actions
+
+提供方法：
+
+* is_state_visited(state_id)
+* mark_state(state_id)
+* is_action_visited(state_id, action)
+* mark_action(state_id, action)
+
+---
+
+## 3 core/strategy.py
+
+实现策略：
+
+* coverage_first（默认）
+* dfs
+* bfs
+
+---
+
+## 4 runner/exploratory_runner.py
+
+实现主循环：
+
+while not stop_condition:
+snapshot
+state_id
+获取可交互元素
+过滤已执行动作
+选择 action
+执行 action
+verification
+记录 trace
+
+---
+
+# 三、Trace 集成
+
+每次探索必须生成 trace：
+
+包含：
+
+* actions
+* expected（自动推断）
+* verification
+* result
+
+---
+
+# 四、停止条件
+
+支持：
+
+* 最大步数（默认 50）
+* 最大 trace 数
+* 无新状态
+
+---
+
+# 五、输出
+
+请输出：
+
+1 exploratory_runner.py 完整实现
+2 exploration_engine.py 实现
+3 state_memory.py 实现
+4 strategy.py 实现
+5 示例 trace
+
+---
+
+# 六、设计原则
+
+* 避免重复路径（必须）
+* 优先探索新元素
+* 每一步都要验证
+* 所有 trace 可 replay
+
+---
+
+# 七、目标效果
+
+系统可以自动：
+
+打开网站 → 探索页面 → 生成多条测试路径 → 自动形成测试资产
