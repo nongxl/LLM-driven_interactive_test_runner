@@ -17,45 +17,69 @@ from core.action_executor import execute
 from tracer.recorder import TraceRecorder
 from tracer.evaluator import TraceEvaluator
 
-async def run_pre_steps(yaml_path: str, recorder: TraceRecorder, log_it):
+async def run_pre_steps(pre_steps: str, recorder: TraceRecorder, log_it):
     """
-    在探索开始前执行一段预设的 YAML 脚本。
-    需要真实抓取快照并调用 AI 进行指令解析。
+    在探索开始前执行预设脚本、回放轨迹或进入手工模式。
     """
     import yaml
     from core.action_executor import execute
     from core.snapshot_manager import get_snapshot
     from ai.llm_client import decide_action
     from ai.prompt_builder import init_step_messages, append_snapshot
+    from tracer.replay_runner import run_replay
     
-    if not os.path.exists(yaml_path):
-        log_it(f"⚠️ 前置脚本不存在: {yaml_path}")
-        return
+    if pre_steps == "__MANUAL__":
+        log_it(f"💡 {os.environ.get('BOLD', '')}已开启【手工自由操作】模式。{os.environ.get('RESET', '')}")
+        log_it("🛑 请在浏览器中完成操作后，在控制台输入: {\"task_status\": \"completed\"}")
         
-    log_it(f"📂 正在启动前置语义解析执行: {yaml_path}")
-    with open(yaml_path, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
-    
-    steps = config.get('steps', [])
-    for i, step_spec in enumerate(steps, 1):
-        instruction = step_spec.get('instruction') if isinstance(step_spec, dict) else str(step_spec)
-        log_it(f" [Pre-Step {i}] 正在分析指令: {instruction}")
-        
-        # 核心修复：为前置脚本的每一步也引入 AI 闭环
-        for retry in range(5): # 每个指令最多重试 5 次 AI 决策
+        while True:
             snapshot = await get_snapshot(logger=log_it)
-            messages = init_step_messages(instruction)
+            messages = init_step_messages("🛑 [手工前置模式] 请先在浏览器中手动完成操作（如登录、验证码等），完成后回复: {\"task_status\": \"completed\"}")
             append_snapshot(messages, snapshot)
             
-            # 调用 AI 决策
             decision = decide_action(messages)
+            if decision.get('action') == 'force_exit':
+                return
+            
             if decision.get('task_status') == 'completed':
-                log_it(f" [Pre-Step {i}] ✅ 指令已标记完成")
+                log_it("✅ 手工前置步骤已确认完成。")
                 break
-                
-            log_it(f" [Pre-Step {i}] (Try {retry+1}) 执行 AI 动作: {json.dumps(decision, ensure_ascii=False)}")
+            
+            # 执行手动输入的动作（如果有）
             await execute(decision)
-            await asyncio.sleep(2.0)
+
+    elif pre_steps.lower().endswith('.json'):
+        log_it(f"📂 正在自动回放前置轨迹 (JSON): {pre_steps}")
+        # 调用回放引擎，close_engine=False 保持 Session
+        replay_res = await run_replay(pre_steps, strict=True, close_engine=False, logger=log_it)
+        if replay_res.get('status') != 'pass':
+            log_it(f"❌ 前置轨迹回放失败: {replay_res.get('error')}")
+    
+    elif os.path.exists(pre_steps):
+        log_it(f"📂 正在启动前置语义解析执行 (YAML): {pre_steps}")
+        with open(pre_steps, 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+        
+        steps = config.get('steps', [])
+        for i, step_spec in enumerate(steps, 1):
+            instruction = step_spec.get('instruction') if isinstance(step_spec, dict) else str(step_spec)
+            log_it(f" [Pre-Step {i}] 正在分析指令: {instruction}")
+            
+            for retry in range(5): 
+                snapshot = await get_snapshot(logger=log_it)
+                messages = init_step_messages(instruction)
+                append_snapshot(messages, snapshot)
+                
+                decision = decide_action(messages)
+                if decision.get('task_status') == 'completed':
+                    log_it(f" [Pre-Step {i}] ✅ 指令已标记完成")
+                    break
+                    
+                log_it(f" [Pre-Step {i}] (Try {retry+1}) 执行动作: {json.dumps(decision, ensure_ascii=False)}")
+                await execute(decision)
+                await asyncio.sleep(1.0)
+    else:
+        log_it(f"⚠️ 无法识别前置步骤配置: {pre_steps}")
 
 
 async def run_exploration(url, max_steps=30, pre_steps=None):
@@ -78,7 +102,12 @@ async def run_exploration(url, max_steps=30, pre_steps=None):
 
     def log_it(msg):
         msg_str = str(msg)
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg_str}", flush=True)
+        # [Optimization] 增加全局 DEBUG 过滤开关
+        is_debug = msg_str.startswith("DEBUG:")
+        show_debug = os.environ.get("TEST_DEBUG") == "1"
+        
+        if not is_debug or show_debug:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg_str}", flush=True)
         try:
             clean_msg = strip_ansi(msg_str)
             with open(log_file_path, 'a', encoding='utf-8') as f:
@@ -145,7 +174,7 @@ async def run_exploration(url, max_steps=30, pre_steps=None):
                 except: pass
                 
                 snapshot_after = await get_snapshot(logger=log_it)
-                v_res = await verify(page, {}, snapshot, snapshot_after)
+                v_res = await verify(page, {}, snapshot, snapshot_after, snapshot_id=snapshot_after.get('snapshot_id'))
                 v_res['health_assessment'] = health
                 
                 log_it(f"验证: {v_res['result']} - {v_res['reason']}")

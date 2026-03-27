@@ -90,13 +90,19 @@ async def find_element_by_semantic_locator(locator: Any) -> Optional[str]:
         log_it(f"  [Auto-Healing] 匹配异常: {e}")
     return None
 
-async def run_replay(trace_file: str, strict: bool = False, step_timeout: int = 10) -> dict:
+async def run_replay(trace_file: str, strict: bool = False, step_timeout: int = 10, close_engine: bool = True, logger=None) -> dict:
     """
     回放指定的 Trace 文件并返回结构化结果。
     :param trace_file: Trace JSON 文件路径
     :param strict: 严格模式，任何步骤失败立即停止
     :param step_timeout: 每一步的最大超时时间（秒）
+    :param close_engine: 是否在运行结束时清理验证引擎 (用于前置步骤调用时保持 Session)
+    :param logger: 可选的日志记录函数
     """
+    global _log_func
+    if logger:
+        _log_func = logger
+
     start_time = time.time()
     result_summary = {
         "trace_file": trace_file,
@@ -275,8 +281,9 @@ async def run_replay(trace_file: str, strict: bool = False, step_timeout: int = 
         result_summary["status"] = "fail"
         result_summary["error"] = f"Fatal replay error: {str(e)}"
     finally:
-        from core.verification_engine import close_verification_engine
-        await close_verification_engine()
+        if close_engine:
+            from core.verification_engine import close_verification_engine
+            await close_verification_engine()
         result_summary["duration"] = round(time.time() - start_time, 2)
         
     return result_summary
@@ -298,7 +305,13 @@ async def main():
         try:
             # 终端显示保留原样（如果支持颜色），但写入文件前必须过滤
             msg_str = str(msg)
-            print(msg_str, end=end, flush=flush)
+            
+            # [Optimization] 增加全局 DEBUG 过滤开关
+            is_debug = msg_str.startswith("DEBUG:")
+            show_debug = os.environ.get("TEST_DEBUG") == "1"
+            
+            if not is_debug or show_debug:
+                print(msg_str, end=end, flush=flush)
             
             clean_msg = strip_ansi(msg_str)
             with open(full_log_path, 'a', encoding='utf-8') as f:

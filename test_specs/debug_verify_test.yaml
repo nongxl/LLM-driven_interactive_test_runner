@@ -1,0 +1,10 @@
+name: Debug Verification Test
+steps:
+  - instruction: "Go to http://www.google.com"
+    expected:
+      type: "url_contains"
+      value: "google"
+  - instruction: "Assert text 'THIS_TEXT_SHOULD_NOT_EXIST_12345' is present"
+    expected:
+      type: "text_present"
+      value: "THIS_TEXT_SHOULD_NOT_EXIST_12345"

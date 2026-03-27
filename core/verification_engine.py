@@ -4,6 +4,8 @@ import asyncio
 import subprocess
 import time
 import sys
+import uuid
+from datetime import datetime
 from typing import Dict, Any, Optional, Union, List
 from playwright.async_api import async_playwright
 
@@ -15,6 +17,9 @@ _keepalive_task: Optional[asyncio.Task] = None
 # [v1.9 修复2] 重连冷却机制：记录上次重连时间，防止高频重连放大断线影响
 _last_reconnect_time: float = 0.0
 _RECONNECT_COOLDOWN_SECS: float = 15.0
+
+# [v1.9.2 优化] 缓存原生弹窗内容，供快照系统读取
+_last_native_dialog: Optional[str] = None
 
 
 async def _keepalive_loop():
@@ -100,6 +105,11 @@ async def initialize_verification_engine():
 
             if not _pw_browser:
                 _pw_browser = await _pw_context_manager.chromium.connect_over_cdp(cdp_url, timeout=15000)
+                
+                # 为所有已存在的页面挂载弹窗处理器
+                for context in _pw_browser.contexts:
+                    for page in context.pages:
+                        _setup_dialog_handler(page)
 
             # [v1.9 修复4] 启动后台保活 Task（如已存在则不重复创建）
             if _keepalive_task is None or _keepalive_task.done():
@@ -109,6 +119,31 @@ async def initialize_verification_engine():
         except Exception as e:
             print(f"DEBUG Error connecting to Playwright: {e}")
             return False
+
+def _setup_dialog_handler(page):
+    """为 Page 挂载自动处理原生弹窗的逻辑"""
+    global _last_native_dialog
+    try:
+        # 如果已经挂载过则不再重复挂载（简单去重）
+        if hasattr(page, "_has_dialog_handler"): return
+        
+        async def handle_dialog(dialog):
+            global _last_native_dialog
+            _last_native_dialog = f"[Browser Dialog] {dialog.type}: {dialog.message}"
+            print(f"  [Auto-Handler] 自动处理弹窗: {dialog.message}", flush=True)
+            await dialog.accept()
+        
+        page.on("dialog", lambda d: asyncio.create_task(handle_dialog(d)))
+        page._has_dialog_handler = True
+    except:
+        pass
+
+def get_last_dialog_message():
+    """读取并清除最后一次捕获的弹窗内容"""
+    global _last_native_dialog
+    msg = _last_native_dialog
+    _last_native_dialog = None # 读取后重置，防止同一弹窗被重复消费
+    return msg
 
 
 async def get_playwright_page(target_url: Optional[str] = None):
@@ -177,6 +212,9 @@ async def get_playwright_page(target_url: Optional[str] = None):
                 if not _pw_page:
                     _pw_page = business_pages[-1]
 
+                # 确保 handler 已挂载
+                _setup_dialog_handler(_pw_page)
+
                 try:
                     # [v1.9 修复1] 心跳轻量化：优先用 is_connected() 本地检查
                     # 只在无法确定时才用 title() 做 CDP 往返验证
@@ -236,7 +274,43 @@ async def close_verification_engine():
             _pw_context_manager = None
 
 
-async def verify(page, expected: Union[Dict[str, Any], List[Dict[str, Any]], None], before_snapshot: Optional[Dict[str, Any]] = None, after_snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+async def _save_verification_debug(page, expected, actual_text, processed_full_text=None, snapshot_id=None):
+    """保存断言失败时的调试信息 (HTML, TXT, PNG)"""
+    try:
+        # 定位 artifacts/tmp 目录
+        proj_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+        tmp_dir = os.path.join(proj_root, 'artifacts', 'tmp')
+        os.makedirs(tmp_dir, exist_ok=True)
+        
+        prefix = f"fail_{snapshot_id}" if snapshot_id else f"fail_{datetime.now().strftime('%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"
+        
+        # 1. 保存期望与实际对比 (JSON)
+        debug_info = {
+            "expected": expected,
+            "actual_reason_summary": actual_text,
+            "timestamp": datetime.now().isoformat()
+        }
+        with open(os.path.join(tmp_dir, f"{prefix}.json"), "w", encoding="utf-8") as f:
+            json.dump(debug_info, f, indent=2, ensure_ascii=False)
+            
+        # 2. 保存完整文本内容 (TXT) - 优先保存用于匹配的真实大文本
+        with open(os.path.join(tmp_dir, f"{prefix}.txt"), "w", encoding="utf-8") as f:
+            f.write(processed_full_text if processed_full_text else actual_text)
+            
+        # 3. 保存 HTML 源码 (HTML)
+        content = await page.content()
+        with open(os.path.join(tmp_dir, f"{prefix}.html"), "w", encoding="utf-8") as f:
+            f.write(content)
+            
+        # 4. 保存截图 (PNG)
+        await page.screenshot(path=os.path.join(tmp_dir, f"{prefix}.png"), full_page=True)
+        
+        print(f"  [Debug] 断言现场已保存至: {prefix}.* (包含匹配用全文本 TXT)", flush=True)
+    except Exception as e:
+        print(f"  [Warn] 保存调试现场失败: {e}", flush=True)
+
+
+async def verify(page, expected: Union[Dict[str, Any], List[Dict[str, Any]], None], before_snapshot: Optional[Dict[str, Any]] = None, after_snapshot: Optional[Dict[str, Any]] = None, snapshot_id: Optional[str] = None) -> Dict[str, Any]:
     """统一验证接口"""
     if not expected:
         return _result("rule", "dom", "pass", 1.0, "未提供预期条件，默认通过", {})
@@ -244,7 +318,7 @@ async def verify(page, expected: Union[Dict[str, Any], List[Dict[str, Any]], Non
     if isinstance(expected, list):
         results = []
         for i, exp_item in enumerate(expected):
-            res = await verify(page, exp_item, before_snapshot, after_snapshot)
+            res = await verify(page, exp_item, before_snapshot, after_snapshot, snapshot_id)
             results.append((exp_item, res))
 
         all_passed = all(r["result"] == "pass" for _, r in results)
@@ -270,6 +344,7 @@ async def verify(page, expected: Union[Dict[str, Any], List[Dict[str, Any]], Non
     interval = 0.5
     elapsed = 0.0
     last_actual = "超时未捕获状态"
+    last_full_text = None
 
     while elapsed < max_wait:
         try:
@@ -293,9 +368,29 @@ async def verify(page, expected: Union[Dict[str, Any], List[Dict[str, Any]], Non
 
             elif exp_type == "text_present":
                 target = "".join(str(exp_value).split()).lower()
-                full_text = await page.evaluate("() => (document.body ? document.body.innerText : '').replace(/\\s+/g, '')")
-                full_text = full_text.lower()
-                if target in full_text:
+                # 增强版文本提取范围：innerText + placeholder + input/textarea value + title 属性
+                full_text = await page.evaluate("""() => {
+                    let text = document.body ? document.body.innerText : '';
+                    
+                    // 补充 input/textarea 的占位符和当前值
+                    const inputs = Array.from(document.querySelectorAll('input, textarea'));
+                    inputs.forEach(el => {
+                        if (el.placeholder) text += ' ' + el.placeholder;
+                        if (el.value) text += ' ' + el.value;
+                    });
+                    
+                    // 补充 title 属性（常用于悬浮提示，也是可见文本源）
+                    const titles = Array.from(document.querySelectorAll('[title]'));
+                    titles.forEach(el => {
+                        if (el.title) text += ' ' + el.title;
+                    });
+                    
+                    return text;
+                }""")
+                last_full_text = full_text
+                processed_text = "".join(full_text.split()).lower()
+                
+                if target in processed_text:
                     return _result("rule", "dom", "pass", 1.0, f"找到文本 '{exp_value}'", {})
                 last_actual = "页面中未找到该文本"
 
@@ -312,6 +407,12 @@ async def verify(page, expected: Union[Dict[str, Any], List[Dict[str, Any]], Non
 
         await asyncio.sleep(interval)
         elapsed += interval
+
+    # 最终失败前保存调试信息
+    if expected:
+        # 如果提供了 snapshot_id 则优先使用，否则尝试从 after_snapshot 提取
+        sid = snapshot_id or (after_snapshot.get('snapshot_id') if after_snapshot else None)
+        await _save_verification_debug(page, expected, last_actual, last_full_text, sid)
 
     return _result("rule", "dom", "fail", 1.0, last_actual, {})
 

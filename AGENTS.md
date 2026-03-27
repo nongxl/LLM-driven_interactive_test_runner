@@ -9,11 +9,14 @@
     - `exploratory_runner.py`: **V3 核心**，驱动自主探索与全流水线生命周期。
     - `tracer/replay_runner.py`: 驱动历史轨迹的高保真重现与自愈验证。
     - `tracer/recorder.py`: 负责测试全过程的流水数据录制与状态对齐。
+    - `tracer/trace_recovery.py`: **V3.2 新增**，离线轨迹还原引擎。支持从日志文件中提取全量快照，高保真生成对应的 JSON 轨迹。
+    - `core/report_generator.py`: **V3.1 新增**，测试结束后自动调用 LLM 生成业务总结报告。
 
 - **引擎层 (`core/`)**:
     - `exploration_engine.py`: 负责自主路径选择与页面健康度评估（Health Assessment）。
     - `trace_clusterer.py`: 基于 LCS 算法的轨迹去重与代表性用例提纯引擎。
-    - `snapshot_manager.py`: 兼具 ARIA 树抓取与**业务异常主动识别**（System Alert）。采用**增量扫描（Incremental Scan）**策略：只在 URL 变化后的首次快照执行三重扫描（Toast/浮窗/关键词），相同 URL 下重复快照直接跳过，显著降低 LLM 决策延迟。**v1.9 起改用 `batch` 命令**，将 `wait networkidle + snapshot` 合并为**单次 IPC 调用**，消除多次进程握手开销。
+    - **SnapshotManager**: 兼具 ARIA 树抓取与**业务异常主动识别**。在 V3.2 中，它配合 `test_runner.py` 将快照全量持久化于日志中，为轨迹恢复提供底层数据支撑。
+采用**增量扫描（Incremental Scan）**策略：只在 URL 变化后的首次快照执行三重扫描（Toast/浮窗/关键词），相同 URL 下重复快照直接跳过，显著降低 LLM 决策延迟。**v1.9 起改用 `batch` 命令**，将 `wait networkidle + snapshot` 合并为**单次 IPC 调用**，消除多次进程握手开销。
 - **执行与验证层**:
     - `action_executor.py`: 指令原子化转换。
     - `verification_engine.py`: 基于 Playwright 的长效 CDP 连结与多维断言系统。
@@ -23,6 +26,7 @@
 
 为了保持根目录整洁，所有开发者必须遵循以下路径约定：
 - **日志**: `artifacts/logs/` (包含探索日志 `log_exploratory_*.log`)
+- **报告**: `artifacts/reports/` (包含 AI 总结报告 `report_*.md` 及截图)
 - **轨迹**: `artifacts/traces/raw/` (原始交互序列)
 - **冒烟用例**: `artifacts/smoke_tests/` (包含手动与探索自动生成的 JSON/YAML 资产)
 - **浏览器配置**: `artifacts/browser_profile*/` (环境隔离的 Profile 目录)
@@ -56,3 +60,11 @@
 2. **增量扫描优先 (Incremental Scan First)**：任何检测逻辑（业务报错、元素状态）应先判断是否需要重复扫描，相同页面状态下应跳过，避免每次快照都触发高代价 `evaluate()`。
 3. **日志不阻塞 (Non-blocking Log)**：日志写入使用 `f.flush()` 即可，严禁引入 `os.fsync()` 到热路径（高频调用的函数）中。
 4. **合并 Round-trip (Batch Evaluate)**：与浏览器之间的 `evaluate()` 调用应尽量合并，避免同一次快照周期内多次往返。
+
+## 🛡️ 弹窗自愈逻辑 (Popup Self-Healing)
+
+为了保证测试流的连续性，V3.1 引入了启发式自愈机制：
+1. **自动识别**：当 `SnapshotManager` 探测到页面存在 `global_alerts` 时触发。
+2. **特征匹配**：框架自动在 ARIA 树中寻找符合 `Close`, `Cancel`, `确定`, `我知道了` 等特征的按钮。
+3. **静默修复**：在 AI 决策前自动点击上述按钮并等待环境稳定。
+4. **留证**：所有被触发自愈的瞬间都会自动截屏存入 `artifacts/reports/screenshots`。

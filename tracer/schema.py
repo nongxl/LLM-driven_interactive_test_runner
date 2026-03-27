@@ -5,6 +5,7 @@ class SnapshotInfo(BaseModel):
     snapshot_hash: str = Field(..., description="Hash of the DOM snapshot")
     page_url: str = Field(..., description="Current page URL")
     title: str = Field(..., description="Current page title")
+    aria_text: Optional[str] = Field(None, description="The full ARIA tree recorded in log")
 
 class SemanticLocator(BaseModel):
     role: Optional[str] = None
@@ -33,8 +34,8 @@ class Expected(BaseModel):
     value: str
 
 class Verification(BaseModel):
-    method: Literal["rule", "ai", "rule+ai", "composite"] = "rule"
-    source: Literal["dom", "snapshot", "various"] = "dom"
+    method: Literal["rule", "ai", "rule+ai", "composite", "log_recovery"] = "rule"
+    source: Literal["dom", "snapshot", "various", "log"] = "dom"
     result: Literal["pass", "fail", "pending"] = "pending"
     confidence: float = Field(1.0, ge=0.0, le=1.0)
     reason: Optional[str] = None

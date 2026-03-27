@@ -3,6 +3,7 @@ import sys
 import subprocess
 import time
 import math
+import argparse
 
 # --- 终端颜色定义 ---
 BLUE = "\033[94m"
@@ -42,7 +43,7 @@ def select_file(directory, extensions=None, title="选择文件"):
     files = []
     for f in os.listdir(directory):
         if extensions:
-            if any(f.lower().endswith(ext) for ext in extensions):
+            if any(f.lower().endswith(ext if isinstance(ext, str) else ext) for ext in (extensions if isinstance(extensions, list) else [extensions])):
                 files.append(f)
         else:
             files.append(f)
@@ -120,17 +121,23 @@ def menu_exploratory():
     
     steps = get_input("探索步数 (Max Steps)", "30")
     
-    print(f"\n{YELLOW}是否需要加载前置步骤 (YAML)?{RESET}")
-    print("  1. 从 test_specs 选择")
-    print("  2. 从 artifacts/smoke_tests 选择")
+    print(f"\n{YELLOW}是否需要加载前置步骤?{RESET}")
+    print("  1. test_specs (YAML)")
+    print("  2. artifacts/smoke_tests (YAML/JSON)")
+    print("  3. artifacts/traces/raw (JSON)")
+    print("  4. ✋ 手工自由操作 (Manual Mode)")
     print("  0. 跳过")
-    sub_choice = input(f"{BOLD}请选择 (0-2): {RESET}").strip()
+    sub_choice = input(f"{BOLD}请选择 (0-4): {RESET}").strip()
     
     pre_steps = None
     if sub_choice == '1':
         pre_steps = select_file("test_specs", [".yaml", ".yml"], "选择前置步骤")
     elif sub_choice == '2':
-        pre_steps = select_file("artifacts/smoke_tests", [".yaml", ".yml"], "从 Smoke Tests 选择前置步骤")
+        pre_steps = select_file("artifacts/smoke_tests", [".yaml", ".yml", ".json"], "从 Smoke Tests 选择前置步骤")
+    elif sub_choice == '3':
+        pre_steps = select_file("artifacts/traces/raw", [".json"], "从录制库选择 JSON 前置轨迹")
+    elif sub_choice == '4':
+        pre_steps = "__MANUAL__"
 
     cmd = ["python", "runner/exploratory_runner.py", url, steps]
     if pre_steps:
@@ -147,11 +154,23 @@ def menu_scripted():
     spec = select_file(dir_path, [".yaml", ".yml"], "选择业务脚本")
     if not spec: return
     
-    pre_choice = input(f"\n{YELLOW}是否需要覆盖前置步骤? (0:跳过, 1:test_specs, 2:smoke_tests): {RESET}").strip()
+    print(f"\n{YELLOW}是否需要覆盖/注入前置步骤?{RESET}")
+    print("  1. test_specs (YAML)")
+    print("  2. artifacts/smoke_tests (YAML/JSON)")
+    print("  3. artifacts/traces/raw (JSON)")
+    print("  4. ✋ 手工自由操作 (Manual Mode)")
+    print("  0. 跳过")
+    pre_choice = input(f"{BOLD}请选择 (0-4): {RESET}").strip()
+    
     pre_steps = None
-    if pre_choice in ['1', '2']:
-        p_dir = "test_specs" if pre_choice == '1' else "artifacts/smoke_tests"
-        pre_steps = select_file(p_dir, [".yaml", ".yml"], "选择前置步骤")
+    if pre_choice == '1':
+        pre_steps = select_file("test_specs", [".yaml", ".yml"], "选择 YAML 前置脚本")
+    elif pre_choice == '2':
+        pre_steps = select_file("artifacts/smoke_tests", [".yaml", ".yml", ".json"], "选择金牌库前置")
+    elif pre_choice == '3':
+        pre_steps = select_file("artifacts/traces/raw", [".json"], "选择 JSON 前置轨迹")
+    elif pre_choice == '4':
+        pre_steps = "__MANUAL__"
     
     cmd = ["python", "runner/test_runner.py", spec]
     if pre_steps: cmd.extend(["--pre-steps", pre_steps])
@@ -202,17 +221,25 @@ def menu_batch():
         time.sleep(1)
         return
 
-    # [NEW] 批量脚本测试支持全局 pre-steps
+    # [NEW] 批量脚本测试支持全局 pre-steps (JSON/YAML/Manual)
     batch_pre_steps = None
     if choice == '1':
-        print(f"\n{YELLOW}是否为该批次所有脚本注入全局前置步骤 (YAML)?{RESET}")
-        print("  1. 从 test_specs 选择")
-        print("  2. 从 artifacts/smoke_tests 选择")
-        print("  0. 跳过 (使用各脚本内定义的或无前置)")
-        p_choice = input(f"{BOLD}请选择 (0-2): {RESET}").strip()
-        if p_choice in ['1', '2']:
-            p_dir = "test_specs" if p_choice == '1' else "artifacts/smoke_tests"
-            batch_pre_steps = select_file(p_dir, [".yaml", ".yml"], "选择全局前置步骤")
+        print(f"\n{YELLOW}是否为该批次所有脚本注入全局前置步骤?{RESET}")
+        print("  1. test_specs (YAML)")
+        print("  2. artifacts/smoke_tests (YAML/JSON)")
+        print("  3. artifacts/traces/raw (JSON)")
+        print("  4. ✋ 手工自由操作 (Manual Mode)")
+        print("  0. 跳过")
+        p_choice = input(f"{BOLD}请选择 (0-4): {RESET}").strip()
+        
+        if p_choice == '1':
+            batch_pre_steps = select_file("test_specs", [".yaml", ".yml"], "选择全局 YAML 前置")
+        elif p_choice == '2':
+            batch_pre_steps = select_file("artifacts/smoke_tests", [".yaml", ".yml", ".json"], "选择全局金牌库前置")
+        elif p_choice == '3':
+            batch_pre_steps = select_file("artifacts/traces/raw", [".json"], "选择全局 JSON 前置")
+        elif p_choice == '4':
+            batch_pre_steps = "__MANUAL__"
 
     print(f"\n{GREEN}即将批量运行 {len(files)} 个任务...{RESET}")
     time.sleep(1)
@@ -263,7 +290,66 @@ def menu_cleanup():
     cleanup_browser_env(force_clean=True)
     input(f"\n{GREEN}[OK] 清理完成。按回车键返回...{RESET}")
 
+def menu_smoke():
+    print_header("7. 自动化回归测试 (Smoke / CI Report)")
+    print(f"{YELLOW}此功能将运行 artifacts/smoke_tests 中的所有金牌用例并生成报告。{RESET}")
+    
+    smoke_dir = "artifacts/smoke_tests"
+    if not os.path.exists(smoke_dir) or not any(f.endswith(".json") for f in os.listdir(smoke_dir)):
+        print(f"\n{RED}❌ 错误: 未找到任何金牌用例。{RESET}")
+        print(f"💡 提示: 请先运行「4. 轨迹聚类与分析」处理录制的轨迹。")
+        time.sleep(2)
+        return
+
+    print(f"\n{YELLOW}是否需要加载全局前置步骤?{RESET}")
+    print("  1. test_specs (YAML)")
+    print("  2. artifacts/smoke_tests (YAML/JSON)")
+    print("  3. artifacts/traces/raw (JSON)")
+    print("  4. ✋ 手工自由操作 (Manual Mode)")
+    print("  0. 跳过")
+    sub_choice = input(f"{BOLD}请选择 (0-4): {RESET}").strip()
+    
+    pre_steps = None
+    if sub_choice == '1':
+        pre_steps = select_file("test_specs", [".yaml", ".yml"], "选择前置步骤")
+    elif sub_choice == '2':
+        pre_steps = select_file("artifacts/smoke_tests", [".yaml", ".yml", ".json"], "从 Smoke Tests 选择前置步骤")
+    elif sub_choice == '3':
+        pre_steps = select_file("artifacts/traces/raw", [".json"], "从录制库选择 JSON 前置轨迹")
+    elif sub_choice == '4':
+        pre_steps = "__MANUAL__"
+
+    strict = get_input("是否开启严格模式 (遇错即停)? (y/n)", "n")
+    cmd = ["python", "ci/run_smoke_tests.py"]
+    if strict.lower() == 'y':
+        cmd.append("--strict")
+    if pre_steps:
+        cmd.extend(["--pre-steps", pre_steps])
+    
+    run_command(cmd)
+
+def menu_recovery():
+    print_header("8. 轨迹恢复 (Trace Recovery)")
+    print(f"{YELLOW}此功能将解析 artifacts/logs 中的全量快照日志并恢复为 JSON 轨迹。{RESET}")
+    
+    log_file = select_file("artifacts/logs", [".log"], "选择要恢复的日志")
+    if not log_file: return
+    
+    cmd = ["python", "tracer/trace_recovery.py", log_file]
+    run_command(cmd)
+
 def main():
+    parser = argparse.ArgumentParser(description="LLM-driven Interactive Test Runner V3")
+    parser.add_argument("--debug", action="store_true", help="显示调试信息 (DEBUG:)")
+    args, unknown = parser.parse_known_args()
+
+    # 设置全局调试环境变量
+    if args.debug:
+        os.environ["TEST_DEBUG"] = "1"
+        print(f"{BLUE}[INFO] 调试模式已开启 (DEBUG 日志将显示){RESET}")
+    else:
+        os.environ["TEST_DEBUG"] = "0"
+
     while True:
         clear_screen()
         print_header("主菜单")
@@ -274,16 +360,20 @@ def main():
         print(f"  {BLUE}4.{RESET} 轨迹聚类与分析 (Trace Analysis)")
         print(f"  {BLUE}5.{RESET} 环境清理 (Cleanup)")
         print(f"  {BLUE}6.{RESET} {BOLD}自动化批量测试 (Batch Test){RESET}")
+        print(f"  {BLUE}7.{RESET} {BOLD}自动化回归测试 (Smoke / CI Report){RESET}")
+        print(f"  {BLUE}8.{RESET} {BOLD}轨迹恢复 (Trace Recovery){RESET}")
         print(f"  {RED}0.{RESET} 退出 (Exit)")
         print()
         
-        choice = input(f"{BOLD}输入编号 (0-6): {RESET}").strip()
+        choice = input(f"{BOLD}输入编号 (0-7): {RESET}").strip()
         if choice == '1': menu_exploratory()
         elif choice == '2': menu_scripted()
         elif choice == '3': menu_replay()
         elif choice == '4': menu_analyser()
         elif choice == '5': menu_cleanup()
         elif choice == '6': menu_batch()
+        elif choice == '7': menu_smoke()
+        elif choice == '8': menu_recovery()
         elif choice == '0': break
         else: time.sleep(1)
 

@@ -9,8 +9,45 @@ from datetime import datetime
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from tracer.recorder import TraceRecorder
+from tracer.replay_runner import run_replay
+from tracer.evaluator import TraceEvaluator
 from core.utils import cleanup_browser_env, strip_ansi, S_OK, S_ERR, S_WARN, S_INFO
 from core.verification_engine import initialize_verification_engine, get_playwright_page, verify, close_verification_engine
+from core.report_generator import ReportGenerator
+import re
+
+async def _self_heal_popups(snapshot, log_it):
+    """
+    启发式弹窗自愈逻辑：
+    寻找页面中常见的“关闭”、“取消”、“我知道了”等按钮并尝试自动点击
+    """
+    aria_text = snapshot.get('aria_text', '')
+    global_alerts = snapshot.get('global_alerts', '')
+    if not global_alerts: return False
+
+    # 常见关闭/取消关键字
+    heal_keywords = ["关闭", "取消", "我知道了", "OK", "确定", "不再提示", "Close", "Cancel", "Confirm", "×"]
+    
+    # 从 ARIA Tree 中提取所有 ref
+    # 格式示例: - button "取 消" [ref=e14]
+    found_ref = None
+    for kw in heal_keywords:
+        # 更加精准的正则匹配，寻找按钮
+        pattern = r'button\s+"[^"]*?' + re.escape(kw) + r'[^"]*?"\s+\[ref=(e\d+)\]'
+        match = re.search(pattern, aria_text, re.IGNORECASE)
+        if match:
+            found_ref = match.group(1)
+            log_it(f"{S_INFO} [自愈引擎] 发现潜在的关闭按钮 '{kw}' (ref={found_ref})，尝试自动修复环境...")
+            break
+    
+    if found_ref:
+        from core.action_executor import execute
+        heal_action = {"action": "click", "target": found_ref, "task_status": "in_progress"}
+        await execute(heal_action)
+        await asyncio.sleep(1.0) # 给弹窗消失一点时间
+        return True
+    
+    return False
 
 async def run_test(test_file, pre_steps_override=None):
     """运行测试用例"""
@@ -35,14 +72,25 @@ async def run_test(test_file, pre_steps_override=None):
         os.makedirs(log_dir, exist_ok=True)
 
         def log_it(msg):
-            msg_str = str(msg)
-            print(msg_str, flush=True)
+            msg_str = str(msg).strip()
+            # [Optimization] 增加更鲁棒的全局 DEBUG 过滤开关
+            is_debug = "DEBUG:" in msg_str.upper() or msg_str.startswith("Wait ") or msg_str.startswith("Batch ")
+            show_debug = os.environ.get("TEST_DEBUG") == "1"
+            
+            # 1. 控制台输出逻辑：确保用户能看到 ARIA Tree 和 ref 编号
+            if not is_debug or show_debug:
+                # 移除恢复专用的静默标签后再打印，保持控制台整洁且信息完整
+                display_msg = msg_str.replace("[Snapshot ARIA]", "").replace("[/Snapshot ARIA]", "").strip()
+                if display_msg:
+                    print(display_msg, flush=True)
+                
             try:
+                # 2. 文件保存逻辑：记录原始消息（包含标签，用于轨迹恢复）
                 # 过滤日志文件中的 ANSI 并统一使用 UTF-8
                 clean_msg = strip_ansi(msg_str)
                 with open(log_file, 'a', encoding='utf-8') as f:
                     f.write(clean_msg + "\n")
-                    f.flush()  # [v1.8 优化D] 移除 os.fsync，保留缓冲式 flush 即可
+                    f.flush()
             except Exception:
                 pass
 
@@ -66,18 +114,37 @@ async def run_test(test_file, pre_steps_override=None):
         final_steps = []
         
         if isinstance(pre_steps, str):
-            # 引入双路径搜索策略: 1. 脚本目录 2. 当前 CWD
-            pre_file = os.path.join(os.path.dirname(test_file), pre_steps)
-            if not os.path.exists(pre_file):
-                pre_file = pre_steps # 尝试 CWD
-                
-            if os.path.exists(pre_file):
-                log_it(f"{S_INFO} 正在合并前置步骤 (Include): {pre_file}")
-                with open(pre_file, 'r', encoding='utf-8') as pf:
-                    pre_case = yaml.safe_load(pf)
-                    final_steps = pre_case.get('steps', [])
+            if pre_steps == "__MANUAL__":
+                log_it(f"{S_INFO} 已开启【手工自由操作】模式。请在浏览器中完成操作后，在控制台输入 completed 结束前置步骤。")
+                final_steps = [{
+                    "instruction": "🛑 [手工前置模式] 请先在浏览器中完成任何必要的手工预处理内容操作（如滑条、验证码、复杂登录等）。完成后请在下方输入: {\"task_status\": \"completed\"}",
+                    "expected": None
+                }]
             else:
-                log_it(f"{S_ERR} 错误: 找不到前置步骤文件: {pre_steps}")
+                # 引入双路径搜索策略: 1. 脚本目录 2. 当前 CWD
+                pre_file = os.path.join(os.path.dirname(test_file), pre_steps)
+                if not os.path.exists(pre_file):
+                    pre_file = pre_steps # 尝试 CWD
+                    
+                if os.path.exists(pre_file):
+                    if pre_file.lower().endswith('.json'):
+                        log_it(f"{S_INFO} 正在自动回放前置轨迹 (JSON): {pre_file}")
+                        # 使用异步延迟加载，确保浏览器进程完全就绪
+                        await asyncio.sleep(1)
+                        # 调用回放引擎，close_engine=False 保持 Session
+                        replay_res = await run_replay(pre_file, strict=True, close_engine=False, logger=log_it)
+                        if replay_res.get('status') != 'pass':
+                            log_it(f"{S_ERR} 前置轨迹回放失败: {replay_res.get('error')}")
+                            execution_error = f"Pre-step trace replay failed: {replay_res.get('error')}"
+                            all_steps_completed = False
+                            # 这里不再 return，让下面的 steps 逻辑根据 all_steps_completed 状态决定是否跳过
+                    else:
+                        log_it(f"{S_INFO} 正在合并前置步骤 (YAML): {pre_file}")
+                        with open(pre_file, 'r', encoding='utf-8') as pf:
+                            pre_case = yaml.safe_load(pf)
+                            final_steps = pre_case.get('steps', [])
+                else:
+                    log_it(f"{S_ERR} 错误: 找不到前置步骤文件: {pre_steps}")
         elif isinstance(pre_steps, list):
             final_steps = pre_steps
             
@@ -108,6 +175,19 @@ async def run_test(test_file, pre_steps_override=None):
                     expected = None
 
                 log_it(f"\n>>>> 开始执行步骤 {i}: {instruction} <<<<")
+                
+                # [v3.2 优化] 登录状态自愈：如果已经在门户首页，且指令看起来像是在尝试登录，则自动跳过
+                if i > 1: # 仅对后续步骤生效
+                    try:
+                        page = await get_playwright_page()
+                        if page and "navigator/index/portal" in page.url:
+                            # 如果指令包含账号、密码、登录等关键字，且当前就在首页，说明已经登录
+                            login_kws = ["账号", "密码", "登录", "admin", "login", "password", "username"]
+                            if any(kw in instruction.lower() for kw in login_kws):
+                                log_it(f"{S_OK} [状态同步] 检测到页面已在门户首页，自动跳过重复的登录步骤: {instruction}")
+                                continue
+                    except: pass
+
                 recorder.begin_step(instruction=instruction, expected_dict=expected)
 
                 retry_count = 0
@@ -129,6 +209,23 @@ async def run_test(test_file, pre_steps_override=None):
                         step_start_snapshot = snapshot
 
                     aria_text = snapshot.get('aria_text', '')
+                    global_alerts = snapshot.get('global_alerts', '')
+                    
+                    # [v3.2 优化] 将全量 ARIA Tree 记录进日志（控制台静默），方便后续轨迹恢复
+                    log_it(f"[Snapshot ARIA]\n{aria_text}\n[/Snapshot ARIA]")
+
+                    # [v1.9.5 自动凭证积累] 检测到业务异常时自动触发截屏
+                    if global_alerts:
+                        log_it(f"{S_WARN} 🚨 检测到业务异常/弹窗: {global_alerts}")
+                        log_it(f"{S_INFO} 正在自动保存截屏凭证至 artifacts/reports/screenshots ...")
+                        # 构造截屏指令并执行
+                        screenshot_action = {"action": "screenshot", "task_status": "in_progress"}
+                        await execute(screenshot_action)
+                        
+                        # [v3.1 新增] 触发弹窗自愈逻辑
+                        if await _self_heal_popups(snapshot, log_it):
+                            # 自愈成功后，刷新快照以便 AI 在干净的环境下决策
+                            snapshot = await get_snapshot(logger=log_it)
 
                     if aria_text == 'Timeout':
                         retry_count += 1
@@ -249,7 +346,7 @@ async def run_test(test_file, pre_steps_override=None):
                         snapshot_after = await get_snapshot(logger=log_it)
                         
                         # 执行验证
-                        v_result = await verify(page, expected, snapshot, snapshot_after)
+                        v_result = await verify(page, expected, snapshot, snapshot_after, snapshot_id=snapshot_after.get('snapshot_id'))
                         log_it(f"验证结果: {v_result['result']} ({v_result['method']}) - {v_result['reason']}")
                         
                         post_hash = snapshot_after.get('hash', f"hash_{len(snapshot_after.get('aria_text',''))}")
@@ -300,7 +397,7 @@ async def run_test(test_file, pre_steps_override=None):
                 
                 for key, val in test_goal.items():
                     sub_expected = {"type": key, "value": val}
-                    v_res = await verify(page, sub_expected, after_snapshot=snapshot_final)
+                    v_res = await verify(page, sub_expected, after_snapshot=snapshot_final, snapshot_id=snapshot_final.get('snapshot_id'))
                     log_it(f"  - {key}: {v_res['result']} - {v_res['reason']}")
                     if v_res['result'] != 'pass':
                         goal_passed = False
@@ -332,29 +429,40 @@ async def run_test(test_file, pre_steps_override=None):
         from tracer.evaluator import TraceEvaluator
         from core.verification_engine import close_verification_engine
         
-        await close_verification_engine()
-        
-        trace_status = "pass" if test_passed else "fail"
-        confidence = TraceEvaluator.calculate_confidence(recorder.trace)
-        
-        recorder.finish(status=trace_status, confidence=confidence, error_message=execution_error)
-        saved_path = recorder.save(os.path.join("artifacts", "traces", "raw"))
-        
-        msg_finish = (
-            f"\n{'='*50}\n"
-            f"测试完成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"Trace 已保存至: {saved_path}\n"
-            f"Confidence: {confidence}\n"
-            f"{'='*50}"
-        )
+        # [v3.2 优先级优化] 核心产出落盘优先：先保存 Trace，再尝试清理环境
+        # 即使 cleanup 挂起，文件也已经安全写入磁盘
         try:
-            log_it(msg_finish)
-        except NameError:
-            print(msg_finish)
+            trace_status = "pass" if test_passed else "fail"
+            confidence = TraceEvaluator.calculate_confidence(recorder.trace)
+            
+            recorder.finish(status=trace_status, confidence=confidence, error_message=execution_error)
+            saved_path = recorder.save(os.path.join("artifacts", "traces", "raw"))
+            
+            msg_finish = (
+                f"\n{'='*50}\n"
+                f"测试完成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"Trace 已保存至: {saved_path}\n"
+                f"Confidence: {confidence}\n"
+                f"{'='*50}"
+            )
+            try:
+                log_it(msg_finish)
+            except NameError:
+                print(msg_finish)
+        except Exception as e:
+            try: log_it(f"⚠️ Trace 最终保存失败: {e}")
+            except: print(f"⚠️ Trace 最终保存失败: {e}")
 
-        # 6. 退出时优雅关闭 Playwright 连接（不杀 OS 进程）
-        # agent-browser daemon 会自行保存 Profile，供下次测试复用登录状态
-        # 如需完整清理浏览器环境，请在 run.py 中选择「5. 环境清理」
+        # 6. 退出前生成由 AI 驱动的测试报告 (独立异常隔离)
+        try:
+            log_it(f"\n{S_INFO} 正在生成 AI 测试总结报告...")
+            report_path = ReportGenerator.generate(recorder.trace, log_file=log_file)
+            log_it(f"✨ 测试报告已生成: {report_path}")
+        except Exception as report_err:
+            try: log_it(f"⚠️ 报告生成失败: {report_err}")
+            except: pass
+            
+        # 7. 退出时尝试释放浏览器连接 (允许静默失败，不阻塞主进程退出)
         try:
             await close_verification_engine()
         except: pass

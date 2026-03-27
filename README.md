@@ -13,7 +13,18 @@ An intelligent, interactive web automation testing framework powered by **agent-
 - **Exploratory Testing System**:
   - **Autonomous Discovery**: Uses a `Coverage First` strategy to traverse UI branches without a pre-defined script.
   - **State Deduplication**: `StateMemory` prevents redundant actions by fingerprinting ARIA tree states.
-- **AI-Powered Verification**: A sophisticated `Verification Engine` that combines rule-based DOM checks with AI-based snapshot analysis as a fallback.
+- **AI-Powered Verification (v2.0)**: 
+  - **Enhanced Matching**: Now detects text in input **placeholders**, **values**, and **title** attributes, preventing false-negative misses.
+  - **Debug Visualizer**: Automatically captures failed assertion state (Full-Page PNG, HTML Source, Processed TXT Source, and expectation JSON) in `artifacts/tmp/` for instant post-mortem analysis.
+  - **Manual Mode**: Injects a "Human-in-the-loop" pause (`__MANUAL__`) for solving complex UI barriers like CAPTCHAs or MFA before automation takes over.
+- **AI-Powered Test Reporting (v3.1)**: [NEW]
+  - **Automated Summarization**: Uses LLM to extract "Test Points" and "Key Findings" from raw interaction traces.
+  - **Evidence Association**: Automatically links relevant screenshots to their corresponding test steps in a structured Markdown report.
+- **Log-to-Trace Recovery (v3.2)**: [NEW]
+  - **Post-mortem Restoration**: Reconstructs full `.json` traces from `.log` files, enabling replay of failed or interrupted sessions.
+  - **High-Fidelity Snapshots**: Captures full ARIA trees in logs for perfect state restoration.
+- **Heuristic Popup Self-Healing (v3.1)**: [NEW]
+  - **Zero-Touch Resilience**: Automatically identifies and dismisses non-critical UI barriers (Close, Cancel, "I know") using ARIA-tree heuristic matching before AI decision-making.
 
 <details>
 <summary><b>🇨🇳 点击展开中文特性说明 (Click to expand Chinese Features)</b></summary>
@@ -25,6 +36,9 @@ An intelligent, interactive web automation testing framework powered by **agent-
   - **自动发现**：无需脚本，采用“覆盖率优先”算法自动遍历 UI 分支。
   - **状态去重**：通过 `StateMemory` 对 ARIA 树进行指纹识别，防止死循环。
 - **AI 辅助验证**：结合规则校验（URL、文本、元素）与 AI 视觉分析，确保测试结果真实有效。
+- **AI 测试报告总结 (v3.1)**：[新增] 自动从轨迹中提取要点、总结发现并生成美观的 Markdown 报告。
+- **离线轨迹还原 (v3.2)**：[新增] 支持从日志文件中提取全量快照，高保真生成对应的 JSON 轨迹，作为容灾恢复手段。
+- **启发式弹窗自愈 (v3.1)**：[新增] 在决策前自动识别并点击关闭/取消类冗余弹窗，确保无人值守执行。
 - **自愈定位器**：优先使用 `ref=eXX` 定位，若目标漂移则触发 `Auto-Healing` 自动修复。
 </details>
 
@@ -41,7 +55,7 @@ An intelligent, interactive web automation testing framework powered by **agent-
 │   ├── traces/             # Recorded execution traces (raw)
 │   ├── smoke_tests/        # Refined test specs (JSON/YAML) (统一冒烟目录)
 │   ├── browser_profile*/    # Isolated browser profiles
-│   └── reports/            # Screenshots and OCR debugging data
+│   └── reports/            # Markdown reports and evidence screenshots
 
 ├── ai/
 │   ├── llm_client.py       # Terminal interaction & AI verification interface
@@ -98,12 +112,13 @@ python run.py
 ```
 
 执行后，您可以根据菜单选择功能：
-1. **探索性测试**: 支持交互选择 pre-steps 前置步骤。
+1. **探索性测试**: 支持交互选择多种格式的 pre-steps 前置步骤。
 2. **定向脚本**: 具备 **智能分页文件选择器** (10条/页)，支持从 `test_specs` 或 `smoke_tests` 中点选脚本。
 3. **轨迹回放**: 提供可视化轨迹选择列表，优先支持 `smoke_tests` 金牌轨迹回放。
-4. **轨迹分析**: 对录制的原始轨迹进行聚类，提取核心冒烟用例。
-5. **环境清理**: 强力回收残留进程与端口。
-6. **自动化批量测试 [NEW]**: **工业化核心能力**。支持一键扫描目录（如 `smoke_tests`），执行全量回归。
+4. **混合前置任务 [NEW]**: 支持在执行主脚本前，先自动回放一个 JSON 轨迹，或进入 **手工模式** 辅助测试。
+5. **轨迹分析**: 对录制的原始轨迹进行聚类，提取核心冒烟用例。
+6. **环境清理**: 强力回收残留进程与端口。
+7. **自动化批量测试 [NEW]**: **工业化核心能力**。支持一键扫描目录（如 `smoke_tests`），执行全量回归。
 
 ---
 
@@ -148,6 +163,15 @@ steps:
 ```
 *Note: Any recorded traces using `pre_steps` are automatically **self-contained** (the pre-steps are baked into the JSON).*
 
+## 🌟 Latest Enhancements (v2.0 - Current)
+
+**Observation & Resilience Core**:
+
+- **🔍 Debug Visualizer**: No more "guessing" why an assertion failed. Every failure generates a `fail_snapshot_*.{png,html,txt,json}` bundle. The `.txt` file contains the *exact* processed text the engine used, making debugging 10x faster.
+- **✨ Semantic Text Coverage**: The `text_present` rule is now "Human-Aware". It captures text that is visually present but technically stored in attributes like `placeholder` or `value`.
+- **🧩 Universal Pre-steps**: The `run.py` menu now supports choosing between **YAML scripts**, **JSON recorded traces**, or **Full Manual Operation** before starting your main test.
+- **🛡️ Robust Status Sync**: Supports status-only commands like `{"task_status": "completed"}` without a browser action, perfect for human hand-offs.
+
 ## 🚀 Latest Enhancements (v1.8)
 
 **Performance Optimizations** (inspired by Antigravity's low-latency browser design):
@@ -184,6 +208,12 @@ The framework has been significantly upgraded for better **AI Agent compatibilit
 3. **自主探索**：`python runner/exploratory_runner.py <URL> 30`。
 4. **回放轨迹**：`python tracer/replay_runner.py <trace_json_path>`。
 5. **聚类分析与提炼**：`python runner/trace_analyser.py --dir artifacts/traces/raw --output smoke_tests`。
+
+### 🚀 最新增强功能 (v2.0)
+- **🔍 断言现场调试器**: 失败时自动保存 PNG/HTML/JSON 现场，并产出包含清洗后文本的 TXT 源码。
+- **✨ 增强型文本匹配**: `text_present` 现在同步检索 `placeholder`、输入值和 `title` 属性。
+- **🧩 混合前置步骤**: 支持在脚本开始前执行 JSON 轨迹回放，或开启 **✋ 手工操作模式**。
+- **🛡️ 执行器健壮性**: 完美支持 `{"task_status": "completed"}` 等纯状态更新指令，再无报错。
 
 ### 🚀 最新增强功能 (v1.7)
 - **📂 自动化批量测试**：支持对 `smoke_tests` 全量回归，产出 Pass/Fail 汇总报告。

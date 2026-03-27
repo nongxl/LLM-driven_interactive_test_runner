@@ -17,10 +17,15 @@ async def get_snapshot(logger=None, target_url=None):
     异步获取页面快照，使用 asyncio 子进程管理确保可靠超时。
     """
     def log(msg):
+        msg_str = str(msg)
+        # 统一 DEBUG 前缀以受控输出
+        if "DEBUG:" not in msg_str.upper() and not msg_str.startswith(" ["):
+            msg_str = f"DEBUG: {msg_str}"
+        
         if logger:
-            logger(msg)
+            logger(msg_str)
         else:
-            print(msg, flush=True)
+            print(msg_str, flush=True)
 
     # 确保 tmp 目录存在
     tmp_dir = os.path.join(_project_root(), 'artifacts', 'tmp')
@@ -53,19 +58,30 @@ async def get_snapshot(logger=None, target_url=None):
             log(f"DEBUG: 智能等待降级: {str(e)}")
             await asyncio.sleep(1.0)
         
-        # [v1.8 优化A] 异常哨兵：增量扫描策略
-        # 只在 URL 变化后的首次快照时执行全谱探测，避免每次都触发高代价 JS evaluate
-        global _last_scanned_url
-        current_url_for_scan = current_page_url or (page.url if page else "")
-        should_full_scan = (current_url_for_scan != _last_scanned_url)
-        global_alerts = ""
+        # [v1.9.2 优化] 异常哨兵：改进增量扫描策略
+        # 1. 尝试获取底层截获的原生浏览器弹窗 (Alert/Confirm)
+        native_dialog = ""
         try:
-            if page and should_full_scan:
-                # 从环境变量获取自定义关键词，合并默认关键词
+            from core.verification_engine import get_last_dialog_message
+            native_dialog = get_last_dialog_message() or ""
+        except:
+            pass
+
+        global_alerts = native_dialog
+        try:
+            if page:
+                # [v1.9.2 优化] 基础选择器扫描改为必做，仅 Keyword 扫描保留增量策略
+                # 这样可以实时捕捉同 URL 下产生的业务弹窗
                 custom_keywords = os.getenv('AGENT_DETECTION_KEYWORDS', '')
                 default_keywords = "Unauthorized,Denied,Forbidden,403,404,500,无权限,授权,申请,报错,失败,错误,系统繁忙"
                 all_kws = list(set([k.strip() for k in (default_keywords + "," + custom_keywords).split(',') if k.strip()]))
                 
+                # 更新 URL 记录
+                global _last_scanned_url
+                current_url_for_scan = current_page_url or (page.url if page else "")
+                is_url_changed = (current_url_for_scan != _last_scanned_url)
+
+                # [v1.9.5 优化] 业务异常识别：移除 URL 变更限制，确保每一轮都能捕捉弹窗
                 eval_script = f"""() => {{
                     try {{
                         const selectors = [
@@ -75,14 +91,16 @@ async def get_snapshot(logger=None, target_url=None):
                             '.el-message__content',
                             '.el-notification__group',
                             '.toast-message',
+                            '.modal-body',
+                            '.alert-content',
                             '[role="alert"]',
                             '[role="status"]',
-                            '[role="dialog"]'
+                            '[role="dialog"]',
+                            '.ant-modal-confirm-content'
                         ];
-                        const keywords = {json.dumps(all_kws)};
                         const found = [];
                         
-                        // 1. 选择器探测 (框架特定 & ARIA 标准)
+                        // 1. 选择器探测 (必做)
                         selectors.forEach(s => {{
                             document.querySelectorAll(s).forEach(el => {{
                                 const txt = el.innerText.trim();
@@ -90,15 +108,15 @@ async def get_snapshot(logger=None, target_url=None):
                             }});
                         }});
                         
-                        // 2. 视觉覆盖物探测 (高 z-index)
+                        // 2. 视觉覆盖物探测 (必做)
                         const floatingEls = Array.from(document.querySelectorAll('body *')).filter(el => {{
                             try {{
                                 const style = window.getComputedStyle(el);
                                 return (style.position === 'fixed' || style.position === 'absolute') && 
-                                       parseInt(style.zIndex) > 1000 && 
+                                       parseInt(style.zIndex) > 500 && 
                                        el.innerText.trim().length > 0 && 
                                        el.innerText.trim().length < 200 &&
-                                       el.offsetWidth > 0 && el.offsetHeight > 0 &&
+                                       el.offsetWidth > 50 && el.offsetHeight > 20 &&
                                        style.display !== 'none' &&
                                        style.visibility !== 'hidden' &&
                                        parseFloat(style.opacity) > 0.1;
@@ -111,11 +129,11 @@ async def get_snapshot(logger=None, target_url=None):
                             }}
                         }});
 
-                        // 3. 关键词广谱扫描 (Title & Visible Content)
-                        const fullText = (document.title + " " + (document.body ? document.body.innerText : "")).substring(0, 5000); 
+                        // 3. 关键字广谱扫描 (实时，覆盖 SPA 异步弹窗)
+                        const keywords = {json.dumps(all_kws)};
+                        const fullText = (document.title + " " + (document.body ? document.body.innerText : "")).substring(0, 8000); 
                         keywords.forEach(kw => {{
                             if (fullText.includes(kw)) {{
-                                // 如果关键词出现在文本中，且尚未被捕捉
                                 if (!found.some(f => f.includes(kw))) {{
                                     found.push("[Keyword Match] " + kw);
                                 }}
@@ -127,9 +145,11 @@ async def get_snapshot(logger=None, target_url=None):
                         return "ERROR in evaluate: " + e.message;
                     }}
                 }}"""
-                # [v1.8 优化A] 超时从 3.0s 降至 1.5s
-                global_alerts = await asyncio.wait_for(page.evaluate(eval_script), timeout=1.5)
-                # 扫描成功后记录当前 URL，下次相同 URL 时跳过
+                scan_res = await asyncio.wait_for(page.evaluate(eval_script), timeout=2.0)
+                if scan_res:
+                    global_alerts = (global_alerts + " | " + scan_res).strip(" | ")
+                
+                # 更新 URL 记录
                 _last_scanned_url = current_url_for_scan
         except Exception as e:
             log(f"DEBUG: 异常探测抛错: {str(e)}")
@@ -141,7 +161,7 @@ async def get_snapshot(logger=None, target_url=None):
         profile_name = os.getenv('AGENT_BROWSER_PROFILE', 'browser_profile')
         profile_path = os.path.join(os.getcwd(), 'artifacts', profile_name)
         
-        # 将最新的端口和路径写回环境，确保子进程可见
+        # 将最新的端口 and 路径写回环境，确保子进程可见
         env['AGENT_BROWSER_PORT'] = port
 
         max_attempts = 3
@@ -149,13 +169,12 @@ async def get_snapshot(logger=None, target_url=None):
         raw_output = ""
 
         # [v1.9 Batch 模式] 使用 batch 命令执行 snapshot，保留单次 IPC 调用的性能收益
-        # 注意：不在 batch 中加入 wait networkidle，因为 about:blank 等空白页面会导致无限阻塞
-        # 网络等待已由上方 Playwright 层的 wait_for_load_state 覆盖
         batch_commands = json.dumps([
             ["snapshot", "-i", "-C", "-c", "--json"]
         ])
         cmd_base = 'npx.cmd' if os.name == 'nt' else 'npx'
         cmd = f'{cmd_base} --no-install agent-browser --profile "{profile_path}" batch --json'
+        # [v1.9.5] 技术日志标记，确保受控输出
         log(f"DEBUG: [v1.9] 使用 batch/snapshot 模式 (Port: {port})")
 
         for attempt in range(max_attempts):
@@ -219,7 +238,6 @@ async def get_snapshot(logger=None, target_url=None):
                     refs_dict = snap_data.get('refs', {})
 
                     # 与旧版逻辑一致：只拒绝真正空白的 (empty page)
-                    # "(no interactive elements)" 是合法响应（如 about:blank 或纯静态页），应传给 AI
                     if not content or content == "(empty page)":
                         log(f"DEBUG: 页面完全空白 (empty page)，等待 2s 渲染...")
                         await asyncio.sleep(2.0)
@@ -257,11 +275,11 @@ async def get_snapshot(logger=None, target_url=None):
 
         if not effective_snapshot:
             log(f"最终快照提取失败，可能影响后续决策。")
-            return {'aria_text': 'Timeout', 'raw': raw_output, 'global_alerts': global_alerts}
+            return {'aria_text': 'Timeout', 'raw': raw_output, 'global_alerts': global_alerts, 'snapshot_id': 'error'}
 
-        return {'aria_text': effective_snapshot, 'raw': raw_output, 'global_alerts': global_alerts}
-
+        snapshot_id = os.path.splitext(temp_filename)[0]
+        return {'aria_text': effective_snapshot, 'raw': raw_output, 'global_alerts': global_alerts, 'snapshot_id': snapshot_id}
 
     except Exception as e:
         log(f"快照组件异常: {str(e)}")
-        return {'aria_text': '', 'raw': '', 'global_alerts': ''}
+        return {'aria_text': '', 'raw': '', 'global_alerts': '', 'snapshot_id': 'error'}

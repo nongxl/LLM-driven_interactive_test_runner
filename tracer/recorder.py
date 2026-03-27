@@ -118,6 +118,12 @@ class TraceRecorder:
         self.current_step.verification = verification
         self.current_step = None
         
+        # [v3.2 优化] 步骤完成后自动开启增量持久化，防止崩溃丢数据
+        try:
+            self.save(is_partial=True)
+        except:
+            pass
+        
     def finish(self, status: str, confidence: float, error_message: Optional[str] = None):
         """完成 Trace 的记录，计算整体验证分数"""
         end_timestamp = time.time()
@@ -128,18 +134,35 @@ class TraceRecorder:
         self.trace.result.confidence = confidence
         self.trace.result.error_message = error_message
         
-    def save(self, directory: str = "artifacts/traces/raw") -> str:
+    def save(self, directory: str = "artifacts/traces/raw", is_partial: bool = False) -> str:
         """将 JSON 数据写入文件"""
-        os.makedirs(directory, exist_ok=True)
-        time_str = datetime.fromtimestamp(self.start_timestamp).strftime('%m%d_%H%M%S')
-        
-        # 使用简短的状态标识：success -> pass, failure -> fail
-        status = self.trace.result.status
-        status_suffix = "pass" if status == "pass" else "fail"
-        
-        filename = f"trace_{self.spec_id}_{time_str}_{status_suffix}.json"
-        filepath = os.path.join(directory, filename)
-        
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(self.trace.model_dump_json(indent=2))
-        return filepath
+        try:
+            os.makedirs(directory, exist_ok=True)
+            time_str = datetime.fromtimestamp(self.start_timestamp).strftime('%m%d_%H%M%S')
+            
+            # 使用简短的状态标识：success -> pass, failure -> fail
+            status = self.trace.result.status or "fail"
+            status_suffix = "pass" if status == "pass" else "fail"
+            
+            # 增量快照采用特殊后缀
+            filename = f"trace_{self.spec_id}_{time_str}_{status_suffix}"
+            if is_partial:
+                filename += "_partial"
+            filename += ".json"
+            
+            filepath = os.path.join(directory, filename)
+            
+            # 如果是最终保存，且存在之前的 partial 文件，尝试清理它
+            if not is_partial:
+                partial_path = filepath.replace(".json", "_partial.json")
+                if os.path.exists(partial_path):
+                    try: os.remove(partial_path)
+                    except: pass
+
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(self.trace.model_dump_json(indent=2))
+            return filepath
+        except Exception as e:
+            # 增量保存失败不抛错，避免因磁盘/权限问题导致测试中断
+            if not is_partial: raise e
+            return ""

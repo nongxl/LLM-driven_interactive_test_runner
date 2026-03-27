@@ -55,24 +55,34 @@ async def _run(cmd_args):
             clean_stderr = strip_ansi(stderr)
             all_output = (clean_stdout + "\n" + clean_stderr).strip()
             
-            # 特殊处理：10048 端口占用
-            if "10048" in all_output or "Address already in use" in all_output or "只允许使用一次" in all_output:
+            # [Optimization] 精准处理 10048 端口占用
+            # 只有在返回码非 0（真正无法执行）时才进行避让重试
+            if proc.returncode != 0 and ("10048" in all_output or "Address already in use" in all_output or "只允许使用一次" in all_output):
                 if attempt < max_retries:
                     import random
                     wait_sec = 2.0 + random.random() * 2.0
-                    # 此处不使用 log_it，直接打印到标准输出以便在终端看到
-                    print(f"  [WARN] 动作执行检测到端口冲突 (10048)，正在进行第 {attempt} 次避让重试 ({wait_sec:.1f}s)...", flush=True)
+                    print(f"  [WARN] 动作执行检测到端口冲突 (真正的 10048 失败)，正在进行第 {attempt} 次避让重试 ({wait_sec:.1f}s)...", flush=True)
                     await asyncio.sleep(wait_sec)
                     continue
 
-            # 过滤掉冗余的 daemon running 警告
-            warning_pattern_1 = "--profile, --ignore-https-errors ignored: daemon already running. Use 'agent-browser close' first to restart with new options."
-            warning_pattern_2 = "⚠ --profile, --ignore-https-errors ignored: daemon already running. Use 'agent-browser close' first to restart with new options."
-            all_output = all_output.replace(warning_pattern_2, "").replace(warning_pattern_1, "").strip()
+            # 过滤掉冗余的 daemon running 警告以及成功的 10048 探测警告
+            noise_patterns = [
+                "--profile, --ignore-https-errors ignored: daemon already running",
+                "⚠ --profile, --ignore-https-errors ignored: daemon already running",
+                "Address already in use",
+                "10048",
+                "只允许使用一次",
+                "os error 10048"
+            ]
+            
+            lines = all_output.split('\n')
+            clean_lines = []
+            for line in lines:
+                if not any(pattern in line for pattern in noise_patterns):
+                    clean_lines.append(line)
+            all_output = "\n".join(clean_lines).strip()
             
             if proc.returncode != 0:
-                if "daemon already running" in all_output:
-                    return f"{S_WARN} {all_output}"
                 return f"{S_ERR} Error (code {proc.returncode}): {all_output}"
             
             return all_output
@@ -95,8 +105,14 @@ async def execute(action):
     action_type = action.get('action', '').lower()
     target = action.get('target', '')
     value = action.get('value', '')
+    task_status = action.get('task_status', '')
 
     try:
+        # [v1.9.5 优化] 处理纯状态更新指令 (No-Op Action)
+        # 支持用户输入 {"task_status": "completed"} 来手动结束步骤
+        if not action_type and task_status:
+            return f"{S_OK} 状态同步成功: {task_status}"
+
         # 统一判定逻辑：如果返回内容包含错误特征，则直接透传原始信息
         def is_failed(r):
             low_r = r.lower()

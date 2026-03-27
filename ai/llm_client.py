@@ -35,51 +35,66 @@ def decide_action(messages: list, allow_interactive: bool = True) -> Dict[str, A
         return _decide_interactive(messages)
 
 
-def _decide_auto(messages: List[Dict[str, str]], api_key: str, base_url: str, model: str) -> Dict[str, Any]:
-    """自动模式：调用外部 LLM API 进行决策"""
+def query_llm(messages: List[Dict[str, str]], json_mode: bool = False) -> str:
+    """通用的 LLM 调用接口，返回原始字符串内容"""
     global _SESSION_TOKEN_USAGE
+    api_key, base_url, model, mode = _get_api_config()
     
-    # 模拟 Token 统计
-    full_history = "\n".join([m.get("content", "") for m in messages])
-    _SESSION_TOKEN_USAGE += len(full_history) // 4
+    if not api_key:
+        return "Error: AI_API_KEY not set. Cannot perform AI query."
 
-    print(f"🤖 [自动模式] 正在请求 AI 决策 (Model: {model})...")
-    
     try:
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         }
         
-        # 强制要求 JSON 输出的提示增强
-        if messages and messages[0]["role"] == "system":
-            if "JSON" not in messages[0]["content"]:
-                 messages[0]["content"] += "\nReturn ONLY valid JSON format for the action decision."
-
         payload = {
             "model": model,
             "messages": messages,
-            "response_format": {"type": "json_object"},
-            "temperature": 0.1
+            "temperature": 0.3
         }
         
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+            # 强制要求 JSON 输出的提示增强
+            if messages and messages[0]["role"] == "system":
+                # Create a mutable copy of messages if it's a tuple or immutable list
+                if isinstance(messages, tuple):
+                    messages = list(messages)
+                if "JSON" not in messages[0]["content"]:
+                     messages[0]["content"] += "\nReturn ONLY valid JSON format."
+
         response = requests.post(f"{base_url}/chat/completions", headers=headers, json=payload, timeout=60)
         response.raise_for_status()
         
         res_json = response.json()
         content = res_json["choices"][0]["message"]["content"]
         
-        # 记录 Token
         if "usage" in res_json:
             _SESSION_TOKEN_USAGE += res_json["usage"].get("total_tokens", 0)
 
+        return content
+    except Exception as e:
+        return f"Error querying LLM: {str(e)}"
+
+def _decide_auto(messages: List[Dict[str, str]], api_key: str, base_url: str, model: str) -> Dict[str, Any]:
+    """自动模式：调用外部 LLM API 进行决策"""
+    print(f"🤖 [自动模式] 正在请求 AI 决策 (Model: {model})...")
+    
+    content = query_llm(messages, json_mode=True)
+    if content.startswith("Error"):
+        print(f"❌ [自动模式] 请求失败: {content}")
+        print("🔁 降级为手动交互模式...")
+        return _decide_interactive(messages)
+
+    try:
         # 解析决策
         decision = json.loads(content)
         print(f"✅ AI 决策已获得: {json.dumps(decision, ensure_ascii=False)}")
         return decision
-
     except Exception as e:
-        print(f"❌ [自动模式] 请求失败: {str(e)}")
+        print(f"❌ [自动模式] JSON 解析失败: {str(e)}")
         print("🔁 降级为手动交互模式...")
         return _decide_interactive(messages)
 
