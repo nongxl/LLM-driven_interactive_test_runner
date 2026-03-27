@@ -13,7 +13,7 @@
 - **引擎层 (`core/`)**:
     - `exploration_engine.py`: 负责自主路径选择与页面健康度评估（Health Assessment）。
     - `trace_clusterer.py`: 基于 LCS 算法的轨迹去重与代表性用例提纯引擎。
-    - `snapshot_manager.py`: 兼具 ARIA 树抓取与**业务异常主动识别**（System Alert）。
+    - `snapshot_manager.py`: 兼具 ARIA 树抓取与**业务异常主动识别**（System Alert）。采用**增量扫描（Incremental Scan）**策略：只在 URL 变化后的首次快照执行三重扫描（Toast/浮窗/关键词），相同 URL 下重复快照直接跳过，显著降低 LLM 决策延迟。**v1.9 起改用 `batch` 命令**，将 `wait networkidle + snapshot` 合并为**单次 IPC 调用**，消除多次进程握手开销。
 - **执行与验证层**:
     - `action_executor.py`: 指令原子化转换。
     - `verification_engine.py`: 基于 Playwright 的长效 CDP 连结与多维断言系统。
@@ -47,3 +47,12 @@
 
 ---
 *提示：保持 `artifacts/` 作为唯一输出源，任何新增的临时配置文件严禁直接放置于项目根目录。*
+
+## ⚡ 性能设计原则 (v1.8+)
+
+为保证框架执行速度接近 Antigravity 等工具的水平，所有开发者和 AI Agent 在修改核心路径时必须遵守以下原则：
+
+1. **禁止固定延迟 (No Fixed Sleep)**：主执行循环中严禁使用 `await asyncio.sleep(N)` 作为稳定等待手段。应使用 `page.wait_for_load_state('networkidle', timeout=...)` 替代。
+2. **增量扫描优先 (Incremental Scan First)**：任何检测逻辑（业务报错、元素状态）应先判断是否需要重复扫描，相同页面状态下应跳过，避免每次快照都触发高代价 `evaluate()`。
+3. **日志不阻塞 (Non-blocking Log)**：日志写入使用 `f.flush()` 即可，严禁引入 `os.fsync()` 到热路径（高频调用的函数）中。
+4. **合并 Round-trip (Batch Evaluate)**：与浏览器之间的 `evaluate()` 调用应尽量合并，避免同一次快照周期内多次往返。

@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from tracer.recorder import TraceRecorder
 from core.utils import cleanup_browser_env, strip_ansi, S_OK, S_ERR, S_WARN, S_INFO
+from core.verification_engine import initialize_verification_engine, get_playwright_page, verify, close_verification_engine
 
 async def run_test(test_file, pre_steps_override=None):
     """运行测试用例"""
@@ -41,8 +42,7 @@ async def run_test(test_file, pre_steps_override=None):
                 clean_msg = strip_ansi(msg_str)
                 with open(log_file, 'a', encoding='utf-8') as f:
                     f.write(clean_msg + "\n")
-                    f.flush()
-                    os.fsync(f.fileno())
+                    f.flush()  # [v1.8 优化D] 移除 os.fsync，保留缓冲式 flush 即可
             except Exception:
                 pass
 
@@ -121,8 +121,8 @@ async def run_test(test_file, pre_steps_override=None):
                 decision = {} # 预初始化，防止 NameError
 
                 while not step_completed and retry_count < max_retries:
-                    # 抗拥塞：缓解 Windows 端口频繁使用的压力 (2.0s 间隔)
-                    await asyncio.sleep(2.0)
+                    # [v1.8 优化C] 移除 asyncio.sleep(2.0) 固定延迟
+                    # 稳定性由 get_snapshot() 内部的 networkidle 智能等待承接
                     # 1. 获取前置快照
                     snapshot = await get_snapshot(logger=log_it)
                     if not step_start_snapshot:
@@ -352,9 +352,11 @@ async def run_test(test_file, pre_steps_override=None):
         except NameError:
             print(msg_finish)
 
-        # 6. 环境清理 (无论成功失败或中断)
+        # 6. 退出时优雅关闭 Playwright 连接（不杀 OS 进程）
+        # agent-browser daemon 会自行保存 Profile，供下次测试复用登录状态
+        # 如需完整清理浏览器环境，请在 run.py 中选择「5. 环境清理」
         try:
-            cleanup_browser_env(profile_name="browser_profile", logger=log_it)
+            await close_verification_engine()
         except: pass
 
         if not test_passed:

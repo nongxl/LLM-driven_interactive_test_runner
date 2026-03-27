@@ -5,7 +5,7 @@ An intelligent, interactive web automation testing framework powered by **agent-
 ## 🚀 Key Features
 
 - **Dual Data Stream Architecture**: 
-  - **Decision Flow**: Uses `agent-browser` ARIA snapshots for cost-effective AI decision making.
+  - **Decision Flow**: Uses `agent-browser` ARIA snapshots for cost-effective AI decision making, with **Zero-Wait Snapshot** — snapshots are taken immediately upon network idle instead of a fixed delay.
   - **Verification Flow**: Uses Playwright DOM/Page state for high-reliability assertions.
 - **Automated Regression Testing (CI)**: 
   - **Trace Replay**: High-fidelity replay of recorded user journeys with automated state validation.
@@ -147,6 +147,15 @@ steps:
       value: "portal"
 ```
 *Note: Any recorded traces using `pre_steps` are automatically **self-contained** (the pre-steps are baked into the JSON).*
+
+## 🚀 Latest Enhancements (v1.8)
+
+**Performance Optimizations** (inspired by Antigravity's low-latency browser design):
+
+- **⚡ Zero-Wait Snapshot**: Removed the hardcoded `asyncio.sleep(2.0)` from the main execution loop. Page stability is now guaranteed by `networkidle` smart-waiting inside `snapshot_manager.py`.
+- **🔬 Incremental Alert Scan**: Business error detection (Toast / Modal / Keyword scan) now only triggers on the **first snapshot after a URL change** instead of every single call. This avoids repeated high-cost JS `evaluate()` calls on the same page.
+- **🕐 Reduced Scan Timeout**: Alert scan timeout reduced from 3.0s → 1.5s; fallback sleep reduced from 1.0s → 0.1s.
+- **💾 Buffered Log I/O**: Removed `os.fsync()` from the log writer — buffered `f.flush()` is sufficient and eliminates per-line disk I/O overhead.
 
 ## 🌟 Latest Enhancements (v1.5)
 

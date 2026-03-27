@@ -333,10 +333,8 @@ async def main():
         log_it(f"{'='*30}\n")
         
     finally:
-        # 环境清理 (无论成功失败或 Ctrl+C 中断)
-        try:
-            cleanup_browser_env(profile_name="browser_profile_replay", logger=log_it)
-        except: pass
+        # Playwright 已在 run_replay() 内的 finally 中关闭，此处无需再次清理
+        # agent-browser daemon 会自行保存 Profile（不打断进程）
         
         # 记录结束后，根据最终状态重命名日志文件
         if result and result.get("status"):

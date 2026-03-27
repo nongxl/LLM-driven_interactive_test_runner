@@ -36,18 +36,21 @@ def resolve_trace_path(path: str) -> str:
             
     return path
 
-def cleanup_browser_env(port=None, profile_name="browser_profile", logger=None):
+def cleanup_browser_env(port=None, profile_name="browser_profile", logger=None, force_clean=False):
     """
-    通用浏览器环境清理工具，防止资源占用和登录态残留。
+    通用浏览器环境清理工具。
     
     :param port: 可选，指定要清理的端口
     :param profile_name: 要清理的 profile 目录名称
     :param logger: 日志记录函数
+    :param force_clean: True 时才删除 Profile 目录和 tmp（仅由菜单选项5触发）
+                        False（默认）时只清理进程和端口，不动任何文件
     """
     if logger is None:
         logger = print
 
-    logger(f"\n[Cleanup] 正在清理环境 (Profile: {profile_name})...")
+    mode_label = "[完整清理]" if force_clean else "[进程清理]"
+    logger(f"\n[Cleanup] {mode_label} 正在清理环境 (Profile: {profile_name})...")
     
     # 1. 强力终止所有相关进程 (针对 Windows)
     try:
@@ -81,56 +84,55 @@ def cleanup_browser_env(port=None, profile_name="browser_profile", logger=None):
     except Exception as e:
         logger(f" [Warn] 进程清理异常: {e}")
     
-    # 2. 清理指定的 profile 目录 (支持列表或单个名称，且自动匹配 artifacts/ 目录)
-    # 如果 profile_name 为 None，则尝试清理 artifacts/ 下所有 browser_profile*
-    import glob
-    target_patterns = []
-    if profile_name is None or profile_name == "browser_profile":
-        target_patterns = [os.path.join(os.getcwd(), 'artifacts', 'browser_profile*')]
+    # 2. 清理 Profile 目录（仅在 force_clean=True 时执行）
+    if not force_clean:
+        logger(f" [Skip] Profile 目录保留（日常测试模式），登录状态复用")
     else:
-        target_patterns = [os.path.join(os.getcwd(), 'artifacts', profile_name)]
+        import glob
+        target_patterns = []
+        if profile_name is None or profile_name == "browser_profile":
+            target_patterns = [os.path.join(os.getcwd(), 'artifacts', 'browser_profile*')]
+        else:
+            target_patterns = [os.path.join(os.getcwd(), 'artifacts', profile_name)]
 
-    for pattern in target_patterns:
-        for p_path in glob.glob(pattern):
-            if os.path.isdir(p_path):
-                p_name = os.path.basename(p_path)
-                logger(f" [Action] 正在清理 Profile: {p_name}...")
-                success = False
-                for i in range(5):
-                    try:
-                        # 强力清除锁定该目录的所有进程
-                        if sys.platform == "win32":
-                            # 尝试使用 taskkill 杀掉所有残留浏览器
-                            subprocess.run(['taskkill', '/F', '/IM', 'chrome.exe', '/T'], capture_output=True)
-                            subprocess.run(['taskkill', '/F', '/IM', 'msedge.exe', '/T'], capture_output=True)
-                            # 使用 Powershell 杀掉任何路径包含该 profile 名的进程
-                            subprocess.run(['powershell', '-Command', f'Get-Process | Where-Object {{$_.Path -like "*{p_name}*"}} | Stop-Process -Force'], capture_output=True)
-                        
-                        time.sleep(i + 1) # 递增等待时长
-                        shutil.rmtree(p_path)
-                        logger(f" [OK] {p_name} 目录已清理")
-                        success = True
-                        break
-                    except Exception as e:
-                        if i < 4:
-                            logger(f" [Retry] 正在重试 ({i+1}/5): {str(e)[:50]}...")
-                        else:
-                            # 终极方案：重命名而不是删除，让出路径
-                            try:
-                                rename_path = p_path + "_old_" + str(int(time.time()))
-                                os.rename(p_path, rename_path)
-                                logger(f" [OK] {p_name} 已重命名为 {os.path.basename(rename_path)} (原目录仍被锁定)")
-                                success = True
-                            except:
-                                logger(f" [Warn] 目录 {p_name} 清理失败: {e}")
+        for pattern in target_patterns:
+            for p_path in glob.glob(pattern):
+                if os.path.isdir(p_path):
+                    p_name = os.path.basename(p_path)
+                    logger(f" [Action] 正在清理 Profile: {p_name}...")
+                    success = False
+                    for i in range(5):
+                        try:
+                            if sys.platform == "win32":
+                                subprocess.run(['taskkill', '/F', '/IM', 'chrome.exe', '/T'], capture_output=True)
+                                subprocess.run(['taskkill', '/F', '/IM', 'msedge.exe', '/T'], capture_output=True)
+                                subprocess.run(['powershell', '-Command', f'Get-Process | Where-Object {{$_.Path -like "*{p_name}*"}} | Stop-Process -Force'], capture_output=True)
+                            
+                            time.sleep(i + 1)
+                            shutil.rmtree(p_path)
+                            logger(f" [OK] {p_name} 目录已清理")
+                            success = True
+                            break
+                        except Exception as e:
+                            if i < 4:
+                                logger(f" [Retry] 正在重试 ({i+1}/5): {str(e)[:50]}...")
+                            else:
+                                try:
+                                    rename_path = p_path + "_old_" + str(int(time.time()))
+                                    os.rename(p_path, rename_path)
+                                    logger(f" [OK] {p_name} 已重命名为 {os.path.basename(rename_path)}")
+                                    success = True
+                                except:
+                                    logger(f" [Warn] 目录 {p_name} 清理失败: {e}")
 
-    # 3. 清理 artifacts/tmp 目录
-    tmp_path = os.path.join(os.getcwd(), 'artifacts', 'tmp')
-    if os.path.exists(tmp_path):
-        try:
-            shutil.rmtree(tmp_path)
-            os.makedirs(tmp_path, exist_ok=True)
-            logger(f" [OK] artifacts/tmp 目录已清空")
-        except Exception as e:
-            logger(f" [Warn] artifacts/tmp 清理失败: {e}")
+    # 3. 清理 artifacts/tmp 目录（仅在 force_clean=True 时执行）
+    if force_clean:
+        tmp_path = os.path.join(os.getcwd(), 'artifacts', 'tmp')
+        if os.path.exists(tmp_path):
+            try:
+                shutil.rmtree(tmp_path)
+                os.makedirs(tmp_path, exist_ok=True)
+                logger(f" [OK] artifacts/tmp 目录已清空")
+            except Exception as e:
+                logger(f" [Warn] artifacts/tmp 清理失败: {e}")
 

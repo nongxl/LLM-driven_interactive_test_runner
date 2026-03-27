@@ -197,10 +197,10 @@ async def run_exploration(url, max_steps=30, pre_steps=None):
         except Exception as ce:
             log_it(f"⚠️ 自动化聚类失败: {ce}")
 
-        # 10. 强制环境清理
-        log_it(f"🧹 正在执行最终环境清理...")
+        # 10. 优雅退出：只关闭 Playwright 连接，不杀 OS 进程
+        # agent-browser daemon 自行保存 Profile，供下次测试复用登录状态
+        log_it(f"🧹 正在关闭 Playwright 连接...")
         await close_verification_engine()
-        cleanup_browser_env(profile_name=profile_name, logger=log_it)
 
 
 if __name__ == "__main__":

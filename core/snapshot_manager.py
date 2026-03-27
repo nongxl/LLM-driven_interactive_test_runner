@@ -4,6 +4,10 @@ import os
 import time
 import uuid
 
+# [v1.8 优化A] 增量扫描：追踪上次执行全谱业务异常扫描时的页面 URL
+# 只在 URL 发生变化后的第一次快照中触发三重扫描，其余时跳过
+_last_scanned_url: str = ""
+
 def _project_root():
     """返回项目根目录（package.json 所在位置）"""
     return os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -43,15 +47,20 @@ async def get_snapshot(logger=None, target_url=None):
                 except Exception:
                     pass  # 如果遇到长直连导致 networkidle 超时，直接放行抓取
             else:
-                await asyncio.sleep(1.0)  # 获取 page 失败的降级方案
+                # [v1.8 优化B] 降级路径：从 1.0s 缩短至 0.1s，减少不必要阻塞
+                await asyncio.sleep(0.1)
         except Exception as e:
             log(f"DEBUG: 智能等待降级: {str(e)}")
             await asyncio.sleep(1.0)
         
-        # [NEW] 异常哨兵：广谱探测全局 Toast/Alert/Business Error
+        # [v1.8 优化A] 异常哨兵：增量扫描策略
+        # 只在 URL 变化后的首次快照时执行全谱探测，避免每次都触发高代价 JS evaluate
+        global _last_scanned_url
+        current_url_for_scan = current_page_url or (page.url if page else "")
+        should_full_scan = (current_url_for_scan != _last_scanned_url)
         global_alerts = ""
         try:
-            if page:
+            if page and should_full_scan:
                 # 从环境变量获取自定义关键词，合并默认关键词
                 custom_keywords = os.getenv('AGENT_DETECTION_KEYWORDS', '')
                 default_keywords = "Unauthorized,Denied,Forbidden,403,404,500,无权限,授权,申请,报错,失败,错误,系统繁忙"
@@ -118,7 +127,10 @@ async def get_snapshot(logger=None, target_url=None):
                         return "ERROR in evaluate: " + e.message;
                     }}
                 }}"""
-                global_alerts = await asyncio.wait_for(page.evaluate(eval_script), timeout=3.0)
+                # [v1.8 优化A] 超时从 3.0s 降至 1.5s
+                global_alerts = await asyncio.wait_for(page.evaluate(eval_script), timeout=1.5)
+                # 扫描成功后记录当前 URL，下次相同 URL 时跳过
+                _last_scanned_url = current_url_for_scan
         except Exception as e:
             log(f"DEBUG: 异常探测抛错: {str(e)}")
         
@@ -136,20 +148,24 @@ async def get_snapshot(logger=None, target_url=None):
         effective_snapshot = ""
         raw_output = ""
 
-        # Windows 下使用 npx.cmd
+        # [v1.9 Batch 模式] 使用 batch 命令执行 snapshot，保留单次 IPC 调用的性能收益
+        # 注意：不在 batch 中加入 wait networkidle，因为 about:blank 等空白页面会导致无限阻塞
+        # 网络等待已由上方 Playwright 层的 wait_for_load_state 覆盖
+        batch_commands = json.dumps([
+            ["snapshot", "-i", "-C", "-c", "--json"]
+        ])
         cmd_base = 'npx.cmd' if os.name == 'nt' else 'npx'
+        cmd = f'{cmd_base} --no-install agent-browser --profile "{profile_path}" batch --json'
+        log(f"DEBUG: [v1.9] 使用 batch/snapshot 模式 (Port: {port})")
 
         for attempt in range(max_attempts):
-            log(f"DEBUG: 终端快照请求 (Port: {port}, Try: {attempt+1}/{max_attempts})...")
-            
-            # 改进命令构造：增加超时和更清晰的输出控制
-            cmd = f'npx --no-install agent-browser --profile "{profile_path}" snapshot -i -C -c --json'
+            log(f"DEBUG: Batch 快照请求 (Try: {attempt+1}/{max_attempts})...")
             
             try:
-                # [Fix] 切换为同步阻塞调用，避免 asyncio 在 Windows 下处理子进程时的异常崩溃
                 import subprocess
                 proc = subprocess.run(
                     cmd,
+                    input=batch_commands,       # 通过 stdin 传入命令 JSON
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     env=env,
@@ -157,12 +173,12 @@ async def get_snapshot(logger=None, target_url=None):
                     text=True,
                     encoding='utf-8',
                     errors='ignore',
-                    timeout=30.0
+                    timeout=35.0
                 )
                 
                 stdout_str = proc.stdout.strip()
                 stderr_str = proc.stderr.strip()
-                current_raw = stdout_str
+                raw_output = stdout_str
                 
                 if proc.returncode != 0:
                     if '10048' in stderr_str or 'Address already in use' in stderr_str:
@@ -170,48 +186,74 @@ async def get_snapshot(logger=None, target_url=None):
                         wait_sec = 3.0 + random.random() * 2.0
                         log(f"DEBUG: 检测到端口冲突 (10048)，等待 {wait_sec:.1f}s 避让...")
                         await asyncio.sleep(wait_sec)
-                    log(f"DEBUG: 快照失败 (code: {proc.returncode})")
+                    log(f"DEBUG: 快照失败 (code: {proc.returncode}): {stderr_str[:200]}")
                     continue
 
-                if not current_raw: 
+                if not stdout_str:
                     log("DEBUG: 无快照输出，重试中...")
                     continue
 
-                # JSON 提取增强
-                start_idx = current_raw.find('{')
-                end_idx = current_raw.rfind('}')
-                if start_idx != -1 and end_idx != -1:
-                    json_str = current_raw[start_idx:end_idx+1]
-                    try:
-                        current_dict = json.loads(json_str)
-                        raw_output = current_raw
-                        
-                        if current_dict.get('success', False):
-                            snapshot_data = current_dict.get('data', {})
-                            content = snapshot_data.get('snapshot', '')
-                            detected_url = snapshot_data.get('url', '')
-                            
-                            if content and content != "(empty page)":
-                                with open(temp_file, 'w', encoding='utf-8') as f:
-                                    json.dump(current_dict, f, indent=2, ensure_ascii=False)
-                                effective_snapshot = content
-                                if detected_url: current_page_url = detected_url
-                                log(f" [OK] 快照抓取成功 (URL: {current_page_url})")
-                                break
-                            else:
-                                log("DEBUG: 页面内容为空，等待 2s 渲染...")
-                                await asyncio.sleep(2.0)
-                        else:
-                            log(f"DEBUG: Agent 内部错误: {current_dict.get('error')}")
-                    except json.JSONDecodeError:
-                        log("DEBUG: JSON 解析失败")
+                # 解析 batch 输出：JSON 数组，提取最后一条（snapshot）的 result
+                try:
+                    # 找第一个 [ 到最后一个 ]
+                    arr_start = stdout_str.find('[')
+                    arr_end = stdout_str.rfind(']')
+                    if arr_start == -1 or arr_end == -1:
+                        log("DEBUG: batch 输出不含 JSON 数组，降级重试...")
+                        continue
+                    
+                    batch_results = json.loads(stdout_str[arr_start:arr_end+1])
+                    # 最后一条为 snapshot 命令结果
+                    snap_result_obj = batch_results[-1]
+                    
+                    if not snap_result_obj.get('success', False):
+                        err = snap_result_obj.get('error', '未知错误')
+                        log(f"DEBUG: snapshot 命令失败: {err}")
+                        if attempt < max_attempts - 1:
+                            await asyncio.sleep(2.0 + attempt)
+                        continue
+
+                    snap_data = snap_result_obj.get('result', {})
+                    content = snap_data.get('snapshot', '')
+                    detected_url = snap_data.get('origin', '') or snap_data.get('url', '')
+                    refs_dict = snap_data.get('refs', {})
+
+                    # 与旧版逻辑一致：只拒绝真正空白的 (empty page)
+                    # "(no interactive elements)" 是合法响应（如 about:blank 或纯静态页），应传给 AI
+                    if not content or content == "(empty page)":
+                        log(f"DEBUG: 页面完全空白 (empty page)，等待 2s 渲染...")
+                        await asyncio.sleep(2.0)
+                        continue
+
+                    # 构造与旧版兼容的 raw_output 格式供 Trace 系统使用
+                    compat_dict = {
+                        "success": True,
+                        "data": {
+                            "snapshot": content,
+                            "url": detected_url,
+                            "refs": refs_dict
+                        }
+                    }
+                    with open(temp_file, 'w', encoding='utf-8') as f:
+                        json.dump(compat_dict, f, indent=2, ensure_ascii=False)
+                    
+                    raw_output = json.dumps(compat_dict, ensure_ascii=False)
+                    effective_snapshot = content
+                    if detected_url:
+                        current_page_url = detected_url
+                    log(f" [OK] Batch 快照抓取成功 (URL: {current_page_url}, refs: {len(refs_dict)})")
+                    break
+
+                except (json.JSONDecodeError, IndexError, KeyError) as parse_err:
+                    log(f"DEBUG: batch 输出解析失败: {parse_err}. 原始: {stdout_str[:300]}")
+                    
             except subprocess.TimeoutExpired:
-                log(f"DEBUG: 命令执行超时")
+                log(f"DEBUG: batch 命令执行超时 (35s)")
             except Exception as e:
-                 log(f"DEBUG: 执行异常: {str(e)}")
+                log(f"DEBUG: 执行异常: {str(e)}")
             
             if attempt < max_attempts - 1:
-                await asyncio.sleep(2.0 + attempt) # 递增等待时间
+                await asyncio.sleep(2.0 + attempt)  # 递增等待时间
 
         if not effective_snapshot:
             log(f"最终快照提取失败，可能影响后续决策。")

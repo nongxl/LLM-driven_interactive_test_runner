@@ -259,7 +259,8 @@ def menu_analyser():
 def menu_cleanup():
     print_header("5. 环境清理 (Cleanup Environment)")
     from core.utils import cleanup_browser_env
-    cleanup_browser_env()
+    # force_clean=True：完整清理 Profile 目录和 tmp（仅此处触发）
+    cleanup_browser_env(force_clean=True)
     input(f"\n{GREEN}[OK] 清理完成。按回车键返回...{RESET}")
 
 def main():
