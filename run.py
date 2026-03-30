@@ -141,7 +141,7 @@ def menu_exploratory():
 
     # [NEW] 询问是否开启交互决策模式
     print(f"\n{YELLOW}是否开启【交互决策模式】? (在探索过程中手动输入 JSON 指令){RESET}")
-    is_interactive = input(f"{BOLD}开启请按 y，默认不开启 (y/n): {RESET}").strip().lower() == 'y'
+    is_interactive = input(f"{BOLD}开启请按 y，默认不开启 (y/N): {RESET}").strip().lower() == 'y'
 
     cmd = ["python", "runner/exploratory_runner.py", url, steps]
     if pre_steps:

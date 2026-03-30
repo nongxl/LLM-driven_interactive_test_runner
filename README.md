@@ -120,6 +120,32 @@ python run.py
 6. **环境清理**: 强力回收残留进程与端口。
 7. **自动化批量测试 [NEW]**: **工业化核心能力**。支持一键扫描目录（如 `smoke_tests`），执行全量回归。
 
+### 🎮 Interactive Mode (交互模式)
+
+If you need to manually control the test execution instead of letting the AI decide, use Interactive Mode:
+
+#### 1. Via `run.py` Menu (Recommended)
+When running **Exploratory Test (Option 1)**, the system will prompt:
+`是否开启【交互决策模式】? (在探索过程中手动输入 JSON 指令)`
+Enter **`y`** to enable it.
+
+#### 2. Via Environment Variable
+Force interactive mode globally by setting:
+```bash
+# PowerShell
+$env:EXECUTION_MODE="interactive"
+# .env file
+EXECUTION_MODE=interactive
+```
+
+#### 3. Via Command Line Flags
+Use `-i` or `--interactive` when calling runners directly:
+```bash
+python runner/exploratory_runner.py <URL> 30 --interactive
+```
+
+**💡 Pro Tip**: In interactive mode, enter raw JSON commands like `{"action": "click", "target": "e12"}`. Add a `+` suffix (e.g., `{"target": "e5"}+`) to chain actions without refreshing the snapshot.
+
 ---
 
 ### 原生命令行运行 (不推荐)
@@ -162,6 +188,29 @@ steps:
       value: "portal"
 ```
 *Note: Any recorded traces using `pre_steps` are automatically **self-contained** (the pre-steps are baked into the JSON).*
+
+## 💭 思考过程可视化 (Reasoning Chain)
+
+本框架支持可视化展示 AI 的决策心路历程，适用于使用 **Gemini 1.5 Pro**, **Gemini 2.0 Flash Thinking** 或 **DeepSeek R1** 等具备推理能力模型的场景。
+
+### 如何开启？
+默认情况下为了节省 Token 并保持控制台精简，该功能是**关闭**的。
+在 Windows PowerShell 执行测试前设置以下变量以开启：
+```powershell
+$env:SHOW_THOUGHTS="1"
+python run.py
+```
+或在项目根目录下创建 `.env` 文件：
+```env
+SHOW_THOUGHTS=1
+```
+
+### ⚠️ 重要提示：Token 消耗与成本
+> [!IMPORTANT]
+> **开启思考过程会显著增加每次决策的 Token 消耗量**。
+> 1. **计费逻辑**：推理内容（Reasoning Content）同样会被计入 `Completion Tokens` 计费。
+> 2. **消耗规模**：在复杂 UI 遍历中，AI 的思考过程可能长达数百甚至上千 Token，远超最终的 JSON 指令。
+> 3. **最佳实践**：建议仅在**编写新测试脚本**、**排查 AI 决策异常 (Hallucination)** 或**验证核心业务逻辑**时开启。正式大规模回归测试建议保持默认关闭状态。
 
 ## 🌟 Latest Enhancements (v2.0 - Current)
 
@@ -223,6 +272,7 @@ The framework has been significantly upgraded for better **AI Agent compatibilit
 - **📂 Trace 聚类系统**：基于 **LCS 动态规划算法** 实现海量测试轨迹的自动去重与分类。
 - **🚨 业务报错探测**：已集成 30+ 常见业务报错关键字（无权限、系统故障等）的自动识别。
 - **🤖 Antigravity 适配**：框架已针对 Antigravity 的决策逻辑进行了深度 Prompt 调优。
+- **🎮 增强型交互模式**：支持通过 `run.py`、环境变量或 `-i` 参数随时接管 AI 决策，实现人工干预。
 </details>
 
 ---

@@ -164,6 +164,16 @@ async def run_test(test_file, pre_steps_override=None):
             log_it(f"{S_WARN} 警告: 测试脚本中没有定义任何步骤。")
             execution_error = "No steps defined in test spec"
         else:
+            # [NEW] 初始导航引导：如果定义了 URL，且当前为空页，则自动进行首次跳转
+            try:
+                page = await get_playwright_page()
+                root_url = test_case.get('url')
+                if page and (page.url == "about:blank" or page.url == "data:,") and root_url:
+                    log_it(f"{S_INFO} [初始导航] 检测到浏览器处于空状态，正在自动跳转至起始 URL: {root_url}")
+                    await page.goto(root_url, wait_until="networkidle", timeout=45000)
+            except Exception as e:
+                log_it(f"{S_WARN} [初始导航] 自动跳转失败（非致命）: {e}")
+
             all_steps_completed = True
             is_first_step = True
             for i, step_spec in enumerate(test_steps, 1):
@@ -236,8 +246,12 @@ async def run_test(test_file, pre_steps_override=None):
                     append_snapshot(messages, snapshot)
                     decision = decide_action(messages)
                     if decision:
+                        # [NEW] 鲁棒性提取：处理 list 或 dict 返回
+                        is_list = isinstance(decision, list)
+                        main_action = decision[-1] if is_list else decision
+                        
                         # [Feature] 处理手动模式下的强制退出
-                        if decision.get('action') == 'force_exit':
+                        if main_action.get('action') == 'force_exit':
                             log_it(f"\n{S_WARN} 用户请求退出测试交互...")
                             all_steps_completed = False
                             # 提前终止 recorder
@@ -246,16 +260,33 @@ async def run_test(test_file, pre_steps_override=None):
 
                         messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
                         log_it(f"AI 决策: {json.dumps(decision, ensure_ascii=False)}")
+                        
+                        # [v1.9.8] 核心数据安全性拦截 (Anti-Hallucination Interceptor)
+                        # 支持对列表格式的批量检查
+                        all_values = []
+                        if is_list:
+                            for d in decision: all_values.append(str(d.get('value', '')).lower())
+                        else:
+                            all_values.append(str(decision.get('value', '')).lower())
+
+                        forbidden_data = ["password", "admin@2024", "123456", "system_admin"]
+                        if any(f in val for val in all_values for f in forbidden_data):
+                            # 进行二次指令对齐检查
+                            instruction_text = instruction.lower()
+                            if not any(val in instruction_text for val in all_values):
+                                log_it(f" {S_ERR} [拦截] 检测到数据幻觉: '{decision}' 包含违禁测试数据且未在指令中提及。")
+                                messages.append({"role": "user", "content": f"🚨 [数据违规] 你尝试输入了黑名单习惯性数据。请严格遵循【绝对数据严格性准则】重新决策。"})
+                                continue
                     else:
                         log_it("AI 返回了空的决策，可能是输入被取消。")
                         continue
                     
                     # 重新检查是否已跳出 (多级跳出支持)
-                    if decision.get('action') == 'force_exit': break
+                    if main_action.get('action') == 'force_exit': break
 
                     # 判断是否为“观察型”辅助操作
-                    action_type = decision.get('action', '').lower()
-                    target = decision.get('target', '')
+                    action_type = main_action.get('action', '').lower()
+                    target = main_action.get('target', '')
                     is_auxiliary = action_type in ('snapshot', 'screenshot') or \
                                    (action_type == 'tab' and (not target or str(target).lower() == 'list'))
 
@@ -280,9 +311,12 @@ async def run_test(test_file, pre_steps_override=None):
                         exec_error = result
                         
                     # ====== Trace 系统：准备语义定位器与记录动作 ======
-                    decision_to_record = decision.copy()
-                    decision_to_record['raw_action'] = decision
-                    target_id = decision.get('target')
+                    if is_list:
+                        decision_to_record = [d.copy() for d in decision]
+                    else:
+                        decision_to_record = decision.copy()
+                        
+                    target_id = main_action.get('target')
                     if target_id and isinstance(target_id, str) and target_id.startswith('e'):
                         try:
                             raw_snapshot = json.loads(snapshot.get('raw', '{}'))
@@ -328,7 +362,7 @@ async def run_test(test_file, pre_steps_override=None):
                         continue
 
                     # ====== 进度接管：判断是否需要验证 ======
-                    task_status = decision.get("task_status", "completed")
+                    task_status = main_action.get("task_status", "completed")
                     if task_status == "in_progress":
                         log_it(f"{S_INFO} 当前目标尚未完成 (in_progress)，已记录子动作，跳过验证直接进行下一步操作...")
                         continue
@@ -357,8 +391,8 @@ async def run_test(test_file, pre_steps_override=None):
                             log_it(f"{S_OK} 步骤验证成功")
                         else:
                             # 健壮性改进：如果决策动作为 assert 且 task_status 为 completed，视为人工确认强制通过
-                            cur_action = decision.get('action')
-                            cur_status = decision.get('task_status', 'completed')
+                            cur_action = main_action.get('action')
+                            cur_status = main_action.get('task_status', 'completed')
                             if cur_action == 'assert' and cur_status == 'completed':
                                  log_it(f"{S_WARN} 收到人工强制断言指令 (Action={cur_action}, Status={cur_status})，跳过 YAML 校验并标记步骤完成。")
                                  recorder.finish_step(verification_dict=v_result, post_snapshot_hash=post_hash)
@@ -369,7 +403,10 @@ async def run_test(test_file, pre_steps_override=None):
                                  step_completed = True
                             else:
                                 retry_count += 1
-                                log_it(f"🔁 验证未通过 (Action={cur_action}, Status={cur_status})，尝试重试... ({retry_count}/{max_retries})")
+                                v_reason = v_result.get('reason', '未知原因')
+                                feedback_msg = f"步骤验证未通过: {v_reason}。这通常意味着你尚未完成指令要求的所有子动作（如登录未点击完毕）。请检查当前页面快照并继续执行剩余动作。"
+                                messages.append({"role": "user", "content": feedback_msg})
+                                log_it(f"🔁 验证未通过 (Action={cur_action}, Status={cur_status})，反馈给 AI 并重试... ({retry_count}/{max_retries})")
                     else:
                         # 降级：如果没有 page 对象，跳过验证
                         step_completed = True

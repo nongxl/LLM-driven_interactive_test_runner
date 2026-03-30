@@ -108,7 +108,19 @@ async def _run(cmd_args):
 async def execute(action):
     """
     异步根据 AI 决策执行 agent-browser 命令
+    支持传入单条 dict 指令或多条 dict 组成的 list 指令。
     """
+    if isinstance(action, list):
+        # [NEW] 批量处理动作列表
+        results = []
+        for i, sub_action in enumerate(action, 1):
+            res = await execute(sub_action)
+            results.append(f"({i}) {res}")
+        return " | ".join(results)
+
+    if not isinstance(action, dict):
+        return f"{S_ERR} Error: Action must be a dict or list of dicts, got {type(action).__name__}"
+
     action_type = action.get('action', '').lower()
     target = action.get('target', '')
     value = action.get('value', '')

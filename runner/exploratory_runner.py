@@ -11,11 +11,12 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from core.exploration_engine import ExplorationEngine
 from core.state_memory import StateMemory
-from core.verification_engine import verify, get_playwright_page, close_verification_engine
+from core.verification_engine import verify, get_playwright_page, close_verification_engine, initialize_verification_engine
 from core.snapshot_manager import get_snapshot
 from core.action_executor import execute
 from tracer.recorder import TraceRecorder
 from tracer.evaluator import TraceEvaluator
+from core.report_generator import ReportGenerator
 
 async def run_pre_steps(pre_steps: str, recorder: TraceRecorder, log_it):
     """
@@ -61,23 +62,62 @@ async def run_pre_steps(pre_steps: str, recorder: TraceRecorder, log_it):
             config = yaml.safe_load(f)
         
         steps = config.get('steps', [])
+        # 初始化验证引擎
+        await initialize_verification_engine()
+        
         for i, step_spec in enumerate(steps, 1):
             instruction = step_spec.get('instruction') if isinstance(step_spec, dict) else str(step_spec)
-            log_it(f" [Pre-Step {i}] 正在分析指令: {instruction}")
+            expected = step_spec.get('expected') if isinstance(step_spec, dict) else None
+            log_it(f"\n>>>> [Pre-Step {i}] 正在执行指令: {instruction} <<<<")
             
-            for retry in range(5): 
+            step_completed = False
+            for retry in range(20): # 提升重试次数
                 snapshot = await get_snapshot(logger=log_it)
+                page = await get_playwright_page()
+                
+                # [NEW] 1. 前置校验：如果已经满足预期，则直接完成本步
+                if expected and page:
+                    v_res = await verify(page, expected, after_snapshot=snapshot, snapshot_id=snapshot.get('snapshot_id'))
+                    if v_res['result'] == 'pass':
+                        log_it(f" [Pre-Step {i}] ✅ 前置校验通过，指令已自动完成")
+                        step_completed = True
+                        break
+                
+                # 2. 调用决策
                 messages = init_step_messages(instruction)
                 append_snapshot(messages, snapshot)
-                
                 decision = decide_action(messages)
-                if decision.get('task_status') == 'completed':
-                    log_it(f" [Pre-Step {i}] ✅ 指令已标记完成")
+                
+                # [NEW] 鲁棒性提取：支持 dict 和 list 两种返回格式
+                is_list = isinstance(decision, list)
+                main_decision = decision[-1] if is_list else decision
+                d_status = main_decision.get('task_status') if isinstance(main_decision, dict) else None
+                d_action = main_decision.get('action') if isinstance(main_decision, dict) else None
+
+                if d_status == 'completed':
+                    log_it(f" [Pre-Step {i}] ✅ AI 标记指令完成")
+                    step_completed = True
                     break
+                
+                if d_action == 'force_exit':
+                    return
                     
                 log_it(f" [Pre-Step {i}] (Try {retry+1}) 执行动作: {json.dumps(decision, ensure_ascii=False)}")
                 await execute(decision)
+                
+                # 3. 后置校验（动作执行后立即验证）
+                # 给页面一点点加载时间
                 await asyncio.sleep(1.0)
+                if expected:
+                    snapshot_after = await get_snapshot(logger=log_it)
+                    v_res = await verify(page, expected, after_snapshot=snapshot_after, snapshot_id=snapshot_after.get('snapshot_id'))
+                    if v_res['result'] == 'pass':
+                        log_it(f" [Pre-Step {i}] ✅ 动作执行后验证通过")
+                        step_completed = True
+                        break
+            
+            if not step_completed:
+                log_it(f" [Pre-Step {i}] ❌ 执行失败或重试超限。")
     else:
         log_it(f"⚠️ 无法识别前置步骤配置: {pre_steps}")
 
@@ -207,6 +247,14 @@ async def run_exploration(url, max_steps=30, pre_steps=None, interactive=False):
         saved_path = recorder.save(os.path.join("artifacts", "traces", "raw"))
         log_it(f"\n✅ 探索完成！Trace 已保存至: {saved_path}")
         log_it(f"📜 本次探索日志已保存至: {log_file_path}")
+
+        # 8.5 [NEW] 生成由 AI 驱动的测试报告
+        try:
+            log_it(f"\n>>>> 正在生成 AI 测试总结报告...")
+            report_path = ReportGenerator.generate(recorder.trace, log_file=log_file_path)
+            log_it(f"✨ 测试报告已生成: {report_path}")
+        except Exception as report_err:
+            log_it(f"⚠️ 报告生成失败: {report_err}")
 
         # 9. [自动化闭环] 触发聚类分析与冒烟用例提取
         log_it("\n📊 正在自动生成聚类分析报告与 Smoke Tests...")

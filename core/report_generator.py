@@ -1,7 +1,7 @@
 import os
 import json
 from datetime import datetime
-from ai.llm_client import query_llm
+from ai.llm_client import query_llm, get_current_token_usage
 
 class ReportGenerator:
     """
@@ -14,23 +14,39 @@ class ReportGenerator:
         生成完整的 Markdown 报告
         """
         os.makedirs(output_dir, exist_ok=True)
-        spec_id = trace.metadata.spec_id or "unknown"
+        # 兼容处理 spec_id
+        spec_id = "unknown"
+        if hasattr(trace.metadata, 'spec_id'):
+            spec_id = trace.metadata.spec_id
+        elif isinstance(trace.metadata, dict):
+            spec_id = trace.metadata.get('spec_id', 'unknown')
+
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         report_filename = f"report_{spec_id}_{timestamp}.md"
         report_path = os.path.join(output_dir, report_filename)
 
         # 1. 提取核心统计数据
+        metadata = trace.metadata
+        m_url = getattr(metadata, 'url', None) or (metadata.get('url') if isinstance(metadata, dict) else "unknown")
+        m_start = getattr(metadata, 'start_time', None) or (metadata.get('start_time') if isinstance(metadata, dict) else "unknown")
+        
+        test_result = trace.result
+        r_status = getattr(test_result, 'status', 'unknown') or (test_result.get('status') if isinstance(test_result, dict) else 'unknown')
+        r_conf = getattr(test_result, 'confidence', 0.0) or (test_result.get('confidence') if isinstance(test_result, dict) else 0.0)
+        r_err = getattr(test_result, 'error_message', None) or (test_result.get('error_message') if isinstance(test_result, dict) else None)
+
         stats = {
-            "test_name": trace.metadata.url or trace.metadata.spec_id,
-            "status": trace.result.status if trace.result else "unknown",
-            "confidence": trace.result.confidence if trace.result else 0.0,
-            "start_time": trace.metadata.start_time,
+            "test_name": m_url or spec_id,
+            "status": r_status,
+            "confidence": r_conf,
+            "start_time": m_start,
             "end_time": datetime.now().isoformat(),
             "total_steps": len(trace.steps),
-            "error_message": trace.result.error_message if trace.result else None
+            "error_message": r_err,
+            "token_stats": get_current_token_usage()
         }
 
-        # 2. 构造 AI 总结提示词
+        # 2. 构造 AI 总结提示词并获取总结
         summary_content = ReportGenerator._get_ai_summary(trace)
 
         # 3. 构造 Markdown 内容
@@ -51,16 +67,27 @@ class ReportGenerator:
         findings = []
         
         for i, step in enumerate(trace.steps, 1):
-            status_icon = "✅" if step.verification and step.verification.result == 'pass' else "❌"
-            mission_steps.append(f"Step {i}: {step.instruction} -> {status_icon} {step.verification.reason if step.verification else 'No verification'}")
+            s_instruction = getattr(step, 'instruction', 'Unknown') or (step.get('instruction') if isinstance(step, dict) else 'Unknown')
+            s_verif = getattr(step, 'verification', None) or (step.get('verification') if isinstance(step, dict) else None)
+            
+            v_result = "unknown"
+            v_reason = "No verification"
+            if s_verif:
+                v_result = getattr(s_verif, 'result', 'unknown') or (s_verif.get('result') if isinstance(s_verif, dict) else 'unknown')
+                v_reason = getattr(s_verif, 'reason', 'unknown') or (s_verif.get('reason') if isinstance(s_verif, dict) else 'unknown')
+
+            status_icon = "✅" if v_result == 'pass' else "❌"
+            mission_steps.append(f"Step {i}: {s_instruction} -> {status_icon} {v_reason}")
             
             # 记录坏点 (Assert 失败)
-            if step.verification and step.verification.result != 'pass':
-                findings.append(f"- 业务坏点: 在执行 '{step.instruction}' 时验证失败，原因: {step.verification.reason}")
+            if v_result != 'pass':
+                findings.append(f"- 业务坏点: 在执行 '{s_instruction}' 时验证失败，原因: {v_reason}")
 
         system_prompt = "你是一个专业的自动化测试分析师。请根据提供的测试步骤和验证结果，总结本次测试的‘测试要点’、‘执行结论’以及‘发现的问题’。使用中文，保持专业、精炼。"
+        target_url = getattr(trace.metadata, 'url', 'unknown') or (trace.metadata.get('url') if isinstance(trace.metadata, dict) else 'unknown')
+        
         user_prompt = f"""
-测试目标: {trace.metadata.url}
+测试目标: {target_url}
 执行轨迹记录:
 {chr(10).join(mission_steps)}
 
@@ -104,6 +131,17 @@ class ReportGenerator:
 - **步骤总数**: {stats['total_steps']}
 - **置信度**: {stats['confidence']}
 {f"- **错误信息**: `{stats['error_message']}`" if stats['error_message'] else ""}
+- **Token 消耗预期**: 准确计算 (Gemini API)
+
+---
+
+## 💰 Token 消耗统计
+| 维度 | 消耗数量 (Tokens) |
+| :--- | :--- |
+| **输入 (Prompt)** | {stats['token_stats'].get('prompt', 0)} |
+| **输出 (Completion)** | {stats['token_stats'].get('completion', 0)} |
+| **思考 (Thoughts)** | {stats['token_stats'].get('thoughts', 0)} |
+| **总计 (Total)** | {stats['token_stats'].get('total', 0)} |
 
 ---
 
@@ -116,12 +154,18 @@ class ReportGenerator:
         # 提取有截图的步骤
         screenshots_section = ""
         for i, step in enumerate(trace.steps, 1):
-            for sub in step.sub_actions:
-                if sub.get('action') == 'screenshot':
-                   path = sub.get('value')
-                   # 转换为相对路径以便在文档中引用
-                   rel_path = path.replace('\\', '/')
-                   screenshots_section += f"### 步骤 {i} 现场取证\n![Step {i} Screenshot](../../{rel_path})\n\n"
+            # 鲁棒提取 sub_actions
+            sub_actions = getattr(step, 'sub_actions', []) or (step.get('sub_actions') if isinstance(step, dict) else [])
+            for sub in sub_actions:
+                s_action = getattr(sub, 'action', None) or (sub.get('action') if isinstance(sub, dict) else None)
+                s_value = getattr(sub, 'value', None) or (sub.get('value') if isinstance(sub, dict) else None)
+                
+                if s_action == 'screenshot':
+                   path = s_value
+                   if path:
+                       # 转换为相对路径以便在文档中引用
+                       rel_path = path.replace('\\', '/')
+                       screenshots_section += f"### 步骤 {i} 现场取证\n![Step {i} Screenshot](../../{rel_path})\n\n"
         
         if not screenshots_section:
             screenshots_section = "_（本次执行未触发自动截屏）_\n"

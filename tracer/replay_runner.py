@@ -16,6 +16,7 @@ from tracer.schema import Trace
 from core.action_executor import execute
 from core.snapshot_manager import get_snapshot
 from core.utils import cleanup_browser_env, resolve_trace_path, strip_ansi, S_OK, S_ERR, S_WARN, S_INFO
+from core.report_generator import ReportGenerator
 
 # 全局日志函数句柄，由 main 初始化
 _log_func = print
@@ -90,14 +91,10 @@ async def find_element_by_semantic_locator(locator: Any) -> Optional[str]:
         log_it(f"  [Auto-Healing] 匹配异常: {e}")
     return None
 
-async def run_replay(trace_file: str, strict: bool = False, step_timeout: int = 10, close_engine: bool = True, logger=None) -> dict:
+async def run_replay(trace_file: str, strict: bool = False, step_timeout: int = 10, close_engine: bool = True, logger=None, generate_report: bool = False) -> dict:
     """
     回放指定的 Trace 文件并返回结构化结果。
-    :param trace_file: Trace JSON 文件路径
-    :param strict: 严格模式，任何步骤失败立即停止
-    :param step_timeout: 每一步的最大超时时间（秒）
-    :param close_engine: 是否在运行结束时清理验证引擎 (用于前置步骤调用时保持 Session)
-    :param logger: 可选的日志记录函数
+    :param generate_report: [NEW] 是否在回放结束后异步生成由 AI 驱动的测试报告
     """
     global _log_func
     if logger:
@@ -285,6 +282,23 @@ async def run_replay(trace_file: str, strict: bool = False, step_timeout: int = 
             from core.verification_engine import close_verification_engine
             await close_verification_engine()
         result_summary["duration"] = round(time.time() - start_time, 2)
+
+        # [NEW] 回放报告生成逻辑
+        if generate_report:
+            try:
+                log_it(f"\n{S_INFO} 正在生成由 AI 驱动的回放总结报告...")
+                # 重新对齐 Trace 实体的结果状态供报告器消费
+                from tracer.schema import TraceResult
+                trace.result = TraceResult(
+                    status=result_summary["status"],
+                    confidence=0.9, # 回放由于是确定的，置信度通常较高
+                    error_message=result_summary["error"]
+                )
+                report_path = ReportGenerator.generate(trace)
+                log_it(f"✨ 测试报告已生成: {report_path}")
+                result_summary["report_path"] = report_path
+            except Exception as e:
+                log_it(f"⚠️ 回放报告生成失败: {e}")
         
     return result_summary
 
@@ -335,7 +349,8 @@ async def main():
 
     result = None
     try:
-        result = await run_replay(args.trace_file, strict=args.strict)
+        # CLI 模式下默认开启报告生成
+        result = await run_replay(args.trace_file, strict=args.strict, generate_report=True)
         
         log_it(f"\n{'='*30}")
         log_it(f"回放完成: {result['status'].upper()}")
