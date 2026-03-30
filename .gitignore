@@ -5,3 +5,7 @@ test_specs/pre_login.yaml
 常用命令.txt
 .venv
 artifacts/*
+.env
+.env.local
+*.log
+.browser_profile*

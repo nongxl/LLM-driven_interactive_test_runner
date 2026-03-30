@@ -6,9 +6,12 @@ from datetime import datetime
 from core.ocr_helper import recognize_captcha
 from core.utils import strip_ansi, S_OK, S_ERR, S_WARN, S_INFO
 
-# agent-browser 本地安装路径，通过 npx 调用
-# Windows 下建议使用 npx.cmd 以获得更好兼容性
-AGENT_BROWSER_CMD = 'npx.cmd' if os.name == 'nt' else 'npx'
+# agent-browser 本地安装路径，优先使用 node_modules 中的二进制文件
+LOCAL_BIN = os.path.join(os.path.dirname(__file__), '..', 'node_modules', '.bin', 'agent-browser.cmd' if os.name == 'nt' else 'agent-browser')
+if os.path.exists(LOCAL_BIN):
+    AGENT_BROWSER_CMD = f'"{os.path.abspath(LOCAL_BIN)}"'
+else:
+    AGENT_BROWSER_CMD = 'npx.cmd' if os.name == 'nt' else 'npx'
 
 def _project_root():
     """返回项目根目录（package.json 所在位置）"""
@@ -26,8 +29,14 @@ async def _run(cmd_args):
     profile_name = os.getenv('AGENT_BROWSER_PROFILE', 'browser_profile_replay')
     profile_path = os.path.join(os.getcwd(), 'artifacts', profile_name)
     
-    # 构造完整命令字符串，注意对路径加引号处理
-    cmd_str = f'{AGENT_BROWSER_CMD} agent-browser --profile "{profile_path}" ' + " ".join([f'"{arg}"' if " " in arg or "-" not in arg else arg for arg in cmd_args])
+    # [Fix] 构造完整命令字符串
+    # 如果是 npx 调用，需要中间加 'agent-browser' 参数；若是直连本地二进制，则不需要。
+    if 'node_modules' in AGENT_BROWSER_CMD or 'agent-browser' in AGENT_BROWSER_CMD.lower():
+        base_cmd = AGENT_BROWSER_CMD
+    else:
+        base_cmd = f"{AGENT_BROWSER_CMD} agent-browser"
+        
+    cmd_str = f'{base_cmd} --profile "{profile_path}" ' + " ".join([f'"{arg}"' if " " in arg or "-" not in arg else arg for arg in cmd_args])
 
     max_retries = 3
     for attempt in range(1, max_retries + 1):
@@ -95,8 +104,6 @@ async def _run(cmd_args):
             return f"❌ Error spawning process: {str(e)}"
     
     return f"{S_ERR} Max retries reached for action execution due to conflicts."
-
-
 
 async def execute(action):
     """

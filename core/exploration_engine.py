@@ -68,9 +68,11 @@ class ExplorationEngine:
         except Exception as e:
             return {"status": "unknown", "reason": f"AI 评估异常: {str(e)}", "score": 0.5}
 
-    def decide_next_step(self, snapshot: Dict[str, Any], state_memory) -> Optional[Dict[str, Any]]:
-
-        """决定下一步动作"""
+    def decide_next_step(self, snapshot: Dict[str, Any], state_memory, interactive: bool = False) -> Optional[Dict[str, Any]]:
+        """
+        决定下一步动作。
+        如果 interactive=True，则进入交互模式，等待用户手动输入 JSON 指令。
+        """
         state_id = state_memory.get_state_id(snapshot)
         all_actions = self.get_actions_from_snapshot(snapshot)
         
@@ -80,8 +82,21 @@ class ExplorationEngine:
         # 记录该状态被发现
         state_memory.mark_state(state_id)
         
-        # 调用策略选择动作
-        selected_action = self.strategy_manager.get_action(state_id, all_actions, state_memory)
+        if interactive:
+            from ai.llm_client import decide_action
+            from ai.prompt_builder import init_step_messages, append_snapshot
+            
+            # 构造交互提示
+            instruction = "🛑 [探索交互模式] 请根据当前页面状态，手动输入下一步操作的 JSON 指令。"
+            messages = init_step_messages(instruction)
+            append_snapshot(messages, snapshot)
+            
+            # 调用交互式决策（会触发终端输入）
+            selected_action = decide_action(messages, allow_interactive=True)
+            
+        else:
+            # 调用策略自动选择动作
+            selected_action = self.strategy_manager.get_action(state_id, all_actions, state_memory)
         
         if selected_action:
             # 标记该动作已在该状态下执行

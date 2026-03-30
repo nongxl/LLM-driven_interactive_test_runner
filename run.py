@@ -139,9 +139,15 @@ def menu_exploratory():
     elif sub_choice == '4':
         pre_steps = "__MANUAL__"
 
+    # [NEW] 询问是否开启交互决策模式
+    print(f"\n{YELLOW}是否开启【交互决策模式】? (在探索过程中手动输入 JSON 指令){RESET}")
+    is_interactive = input(f"{BOLD}开启请按 y，默认不开启 (y/n): {RESET}").strip().lower() == 'y'
+
     cmd = ["python", "runner/exploratory_runner.py", url, steps]
     if pre_steps:
         cmd.extend(["--pre-steps", pre_steps])
+    if is_interactive:
+        cmd.append("--interactive")
     
     run_command(cmd)
 
@@ -286,7 +292,7 @@ def menu_analyser():
 def menu_cleanup():
     print_header("5. 环境清理 (Cleanup Environment)")
     from core.utils import cleanup_browser_env
-    # force_clean=True：完整清理 Profile 目录和 tmp（仅此处触发）
+    # force_clean=True：完整清理 Profile 目录 and tmp（仅此处触发）
     cleanup_browser_env(force_clean=True)
     input(f"\n{GREEN}[OK] 清理完成。按回车键返回...{RESET}")
 
@@ -365,7 +371,7 @@ def main():
         print(f"  {RED}0.{RESET} 退出 (Exit)")
         print()
         
-        choice = input(f"{BOLD}输入编号 (0-7): {RESET}").strip()
+        choice = input(f"{BOLD}输入编号 (0-8): {RESET}").strip()
         if choice == '1': menu_exploratory()
         elif choice == '2': menu_scripted()
         elif choice == '3': menu_replay()

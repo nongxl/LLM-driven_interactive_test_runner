@@ -82,7 +82,7 @@ async def run_pre_steps(pre_steps: str, recorder: TraceRecorder, log_it):
         log_it(f"⚠️ 无法识别前置步骤配置: {pre_steps}")
 
 
-async def run_exploration(url, max_steps=30, pre_steps=None):
+async def run_exploration(url, max_steps=30, pre_steps=None, interactive=False):
     """
     运行探索性测试过程。
     """
@@ -149,9 +149,14 @@ async def run_exploration(url, max_steps=30, pre_steps=None):
             log_it(f"📊 状态评估: {health.get('status', 'unknown')} ({health.get('reason', '')})")
             
             # 4. 探索引擎决策
-            decision = engine.decide_next_step(snapshot, memory)
+            decision = engine.decide_next_step(snapshot, memory, interactive=interactive)
             if not decision:
                 log_it("🏁 没有发现更多可消费的交互元素，停止探索。")
+                break
+            
+            # [Feature] 处理手动模式下的强制退出
+            if decision.get('action') == 'force_exit':
+                log_it("🛑 各级人工指令：停止探索。")
                 break
                 
             log_it(f"决定执行: {decision['action']} [{decision.get('ref')}] {decision.get('role')} \"{decision.get('name')}\"")
@@ -238,7 +243,7 @@ if __name__ == "__main__":
     parser.add_argument("url", help="起始 URL")
     parser.add_argument("steps", type=int, nargs="?", default=30, help="最大步数")
     parser.add_argument("--pre-steps", help="前置 YAML 脚本路径")
+    parser.add_argument("-i", "--interactive", action="store_true", help="开启交互式决策模式")
     
     args = parser.parse_args()
-    asyncio.run(run_exploration(args.url, args.steps, args.pre_steps))
-
+    asyncio.run(run_exploration(args.url, args.steps, args.pre_steps, interactive=args.interactive))
