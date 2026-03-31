@@ -1,12 +1,8 @@
-import yaml
-import json
-import os
-import sys
-import asyncio
-from datetime import datetime
-
 # 确保脚本能找到 runner 和 ai 模块
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from dotenv import load_dotenv
+load_dotenv()
 
 from tracer.recorder import TraceRecorder
 from tracer.replay_runner import run_replay

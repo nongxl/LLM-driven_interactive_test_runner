@@ -357,10 +357,14 @@ def main():
     parser.add_argument("--debug", action="store_true", help="显示调试信息 (DEBUG:)")
     args, unknown = parser.parse_known_args()
 
-    # 设置全局调试环境变量
+    # 设置全局调试环境变量 (优先尊重 .env，命令行 --debug 可临时覆盖)
+    env_debug = os.getenv("TEST_DEBUG", "0")
     if args.debug:
         os.environ["TEST_DEBUG"] = "1"
-        print(f"{BLUE}[INFO] 调试模式已开启 (DEBUG 日志将显示){RESET}")
+        print(f"{BLUE}[INFO] 调试模式已开启 (命令行手动触发){RESET}")
+    elif env_debug == "1":
+        os.environ["TEST_DEBUG"] = "1"
+        print(f"{BLUE}[INFO] 调试模式已开启 (来自 .env 配置){RESET}")
     else:
         os.environ["TEST_DEBUG"] = "0"
 

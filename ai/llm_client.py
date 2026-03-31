@@ -27,22 +27,45 @@ def _get_shared_session(proxy=None):
     """获取单例 Session，支持连接池复用"""
     global _SHARED_SESSION
     if _SHARED_SESSION is None:
+        # 如果调用方没传，主动从环境变量读取 (修复回放模式下首调 AI 丢失代理的问题)
+        if not proxy:
+            proxy = os.getenv("AI_PROXY")
+            
         _SHARED_SESSION = requests.Session()
-        
-        # 配置重试逻辑
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504],
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        _SHARED_SESSION.mount("https://", adapter)
-        _SHARED_SESSION.mount("http://", adapter)
-        
         if proxy:
             _SHARED_SESSION.proxies = {"http": proxy, "https": proxy}
+            print(f"  [Init] AI 会话已建立，使用代理: {proxy}")
             
     return _SHARED_SESSION
+
+def _save_prompt_log(messages, response_text, model, error=None):
+    """将 Prompt 和 响应持久化到本地供审计 (仅在 SAVE_PROMPTS=1 时触发)"""
+    if os.getenv("SAVE_PROMPTS") != "1":
+        return
+    
+    import hashlib
+    log_dir = os.path.join("artifacts", "logs", "prompts")
+    os.makedirs(log_dir, exist_ok=True)
+    
+    timestamp = time.strftime("%H%M%S")
+    # 生成内容的短哈希防止文件名过长
+    msg_hash = hashlib.md5(str(messages[-1]).encode()).hexdigest()[:6]
+    status = "error" if error else "ok"
+    filename = f"p_{timestamp}_{model.replace('/','_')}_{msg_hash}_{status}.json"
+    
+    dump_data = {
+        "timestamp": datetime.now().isoformat() if 'datetime' in globals() else time.ctime(),
+        "model": model,
+        "messages": messages,
+        "response": response_text,
+        "error": error
+    }
+    
+    try:
+        with open(os.path.join(log_dir, filename), 'w', encoding='utf-8') as f:
+            json.dump(dump_data, f, indent=2, ensure_ascii=False)
+    except:
+        pass
 
 def _get_api_config():
     """从环境变量或 .env 获取 AI 配置"""
@@ -61,7 +84,7 @@ def _get_api_config():
     return api_key, base_url, model, mode, proxy
 
 def decide_action(messages: list, allow_interactive: bool = True) -> Dict[str, Any]:
-    """决策入口"""
+    """决策入口 (决策属于关键动作，使用 3 次重试 + 60s 超时)"""
     api_key, base_url, model, mode, proxy = _get_api_config()
     
     if mode == "auto" and api_key:
@@ -72,93 +95,107 @@ def decide_action(messages: list, allow_interactive: bool = True) -> Dict[str, A
         return _decide_interactive(messages)
 
 
-def query_llm(messages: List[Dict[str, str]], json_mode: bool = False, proxy: str = None) -> str:
-    """通用的 LLM 调用接口 (Session 复用版)"""
+def query_llm(messages: List[Dict[str, str]], json_mode: bool = False, proxy: str = None, logger=None, timeout: int = 60, max_retries: int = 3) -> str:
+    """通用的 LLM 调用接口 (带日志反馈的手动重试版)"""
     global _SESSION_TOKEN_USAGE
     api_key, base_url, model, mode, _ = _get_api_config()
     
     if not api_key:
         return "Error: AI_API_KEY not set."
 
+    log = logger if logger else print
     session = _get_shared_session(proxy)
+    full_url = base_url.rstrip("/") + "/chat/completions"
     
-    try:
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": 0
-        }
+    last_error = "Unknown error"
+    for attempt in range(max_retries):
+        try:
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            payload = {
+                "model": model,
+                "messages": messages,
+                "temperature": 0
+            }
 
-        # [Feature] 思考型支持
-        # 仅针对明确支持高强度推理的模型开启参数，防止 lite 模型报错或失效
-        if "thinking" in model.lower():
-             payload["reasoning_effort"] = "high"
-        
-        # [v3.5] 兼容性改进：如果模型不支持原生的 reasoning_content，则关闭 json_mode
-        # 强制 AI 在正文中先写思考再写 JSON，代码后续进行手动切割
-        if json_mode:
-            if "thinking" in model.lower() or "o1" in model.lower():
-                payload["response_format"] = {"type": "json_object"}
+            if "thinking" in model.lower():
+                 payload["reasoning_effort"] = "high"
+            
+            if json_mode:
+                if "thinking" in model.lower() or "o1" in model.lower():
+                    payload["response_format"] = {"type": "json_object"}
+
+            log(f"  [LLM] 正在请求 API (模型: {model}, 尝试: {attempt + 1}/{max_retries}, 超时: {timeout}s)...", flush=True)
+            
+            # 在发送前先记录一次 (防止超时导致完全没记录)
+            if attempt == 0:
+                _save_prompt_log(messages, "PENDING...", model)
+
+            response = session.post(full_url, headers=headers, json=payload, timeout=timeout)
+            response.raise_for_status()
+            
+            log(f"  [LLM] 请求成功 (响应: {len(response.text)} bytes)", flush=True)
+            
+            # 请求成功，记录完整内容
+            _save_prompt_log(messages, response.text, model)
+            
+            res_json = response.json()
+            message = res_json["choices"][0]["message"]
+            content = message.get("content", "")
+            
+            # [NEW] 提取推理思维链 (Reasoning / Thinking)
+            # ... (保持原有的推理提取逻辑)
+            reasoning = message.get("reasoning_content") or message.get("reasoning") or message.get("thinking")
+            import re
+            if not reasoning:
+                thought_match = re.search(r'<thought>(.*?)</thought>', content, re.DOTALL | re.IGNORECASE)
+                if thought_match:
+                    reasoning = thought_match.group(1).strip()
+                    content = re.sub(r'<thought>.*?</thought>', '', content, flags=re.DOTALL | re.IGNORECASE).strip()
+                elif "```json" in content:
+                    parts = content.split("```json")
+                    pre_text = parts[0].strip()
+                    if len(pre_text) > 10:
+                        reasoning = pre_text
+                        content = "```json" + parts[1]
+
+            show_thoughts = int(os.environ.get("SHOW_THOUGHTS", "0"))
+            if reasoning and show_thoughts != 0:
+                print(f"\n💭 [AI 逻辑推演]\n{reasoning}\n" + "-"*30)
+
+            if "usage" in res_json:
+                usage = res_json["usage"]
+                _SESSION_TOKEN_USAGE["prompt"] += usage.get("prompt_tokens", 0)
+                _SESSION_TOKEN_USAGE["completion"] += usage.get("completion_tokens", 0)
+                _SESSION_TOKEN_USAGE["total"] += usage.get("total_tokens", 0)
+                _SESSION_TOKEN_USAGE["thoughts"] += usage.get("thoughts_token_count", 0) or usage.get("thoughts_tokens", 0)
+
+            return content
+
+        except Exception as e:
+            last_error = str(e)
+            if hasattr(e, 'response') and e.response is not None:
+                last_error += f" (HTTP {e.response.status_code}: {e.response.text[:200]})"
+            
+            log(f"  [WARN] LLM 第 {attempt + 1} 次尝试异常: {last_error}", flush=True)
+            
+            # 记录错误现场
+            _save_prompt_log(messages, "FAILED", model, error=last_error)
+            
+            # 如果是 429 (频率受限)，多等一会儿
+            if "429" in last_error:
+                log(f"  [Info] 触发频率限制，等待 5s 后重试...", flush=True)
+                time.sleep(5)
+            elif attempt < max_retries - 1:
+                log(f"  [Info] 等待 2s 后进行下一次重试...", flush=True)
+                time.sleep(2)
             else:
-                # Lite 或 Pro 模型不使用 JSON Mode，改为在 Prompt 中强制要求
-                pass 
+                log(f"  [Error] 已达到最大重试次数，放弃请求。", flush=True)
 
-        full_url = base_url.rstrip("/") + "/chat/completions"
-        
-        response = session.post(full_url, headers=headers, json=payload, timeout=60)
-        response.raise_for_status()
-        
-        res_json = response.json()
-        message = res_json["choices"][0]["message"]
-        content = message.get("content", "")
-        
-        # [NEW] 提取推理思维链 (Reasoning / Thinking)
-        # 1. 优先获取模型原生返回的推理字段
-        reasoning = message.get("reasoning_content") or message.get("reasoning") or message.get("thinking")
-        
-        # 2. 如果没有原生字段，尝试从正文中正则表达式提取 (处理 Pro/Lite 模型的内置思考)
-        import re
-        if not reasoning:
-            # 尝试提取 <thought>...</thought> 标签内的内容
-            thought_match = re.search(r'<thought>(.*?)</thought>', content, re.DOTALL | re.IGNORECASE)
-            if thought_match:
-                reasoning = thought_match.group(1).strip()
-                # 从 content 中剔除已提取的思考内容，防止 JSON 解析报错
-                content = re.sub(r'<thought>.*?</thought>', '', content, flags=re.DOTALL | re.IGNORECASE).strip()
-            elif "```json" in content:
-                # 尝试提取 ```json 块之前的描述文字作为推理过程
-                parts = content.split("```json")
-                pre_text = parts[0].strip()
-                if len(pre_text) > 10: # 只有足够长的文字才视为推理
-                    reasoning = pre_text
-                    # 仅保留 JSON 块供后续解析
-                    content = "```json" + parts[1]
-
-        # 实时输出推理过程 (如果环境变量开启且存在推理内容)
-        # [v3.6] 默认关闭 (0)，保护 Token 成本且控制台精简
-        show_thoughts = int(os.environ.get("SHOW_THOUGHTS", "0"))
-        if reasoning and show_thoughts != 0:
-            print(f"\n💭 [AI 逻辑推演]\n{reasoning}\n" + "-"*30)
-
-        if "usage" in res_json:
-            usage = res_json["usage"]
-            _SESSION_TOKEN_USAGE["prompt"] += usage.get("prompt_tokens", 0)
-            _SESSION_TOKEN_USAGE["completion"] += usage.get("completion_tokens", 0)
-            _SESSION_TOKEN_USAGE["total"] += usage.get("total_tokens", 0)
-            # 兼容处理 Gemini 3 思考 Token (支持多种可能的透传 ID)
-            _SESSION_TOKEN_USAGE["thoughts"] += usage.get("thoughts_token_count", 0) or usage.get("thoughts_tokens", 0)
-
-        return content
-    except Exception as e:
-        error_msg = str(e)
-        if hasattr(e, 'response') and e.response is not None:
-            error_msg += f" (Detail: {e.response.text[:200]})"
-        return f"Error: {error_msg}"
+    return f"Error: {last_error}"
 
 def _decide_auto(messages: List[Dict[str, str]], api_key: str, base_url: str, model: str, proxy: str = None, allow_interactive: bool = True) -> Dict[str, Any]:
     """自动模式"""

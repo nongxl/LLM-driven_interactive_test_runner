@@ -9,6 +9,9 @@ from typing import Optional
 # Ensure project root is in path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from core.exploration_engine import ExplorationEngine
 from core.state_memory import StateMemory
 from core.verification_engine import verify, get_playwright_page, close_verification_engine, initialize_verification_engine
@@ -141,6 +144,18 @@ async def run_exploration(url, max_steps=30, pre_steps=None, interactive=False):
     from core.utils import cleanup_browser_env, strip_ansi
 
     def log_it(msg):
+        # 设置全局调试环境变量 (优先尊重 .env，命令行 --debug 可临时覆盖)
+        env_debug = os.getenv("TEST_DEBUG", "0")
+        BLUE = "\033[94m"
+        RESET = "\033[0m"
+        if debug:
+            os.environ["TEST_DEBUG"] = "1"
+            # print(f"{BLUE}[INFO] 调试模式已开启 (命令行手动触发){RESET}")
+        elif env_debug == "1":
+            os.environ["TEST_DEBUG"] = "1"
+        else:
+            os.environ["TEST_DEBUG"] = "0"
+
         msg_str = str(msg)
         # [Optimization] 增加全局 DEBUG 过滤开关
         is_debug = msg_str.startswith("DEBUG:")

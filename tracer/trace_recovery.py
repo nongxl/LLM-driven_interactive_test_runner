@@ -9,7 +9,7 @@ from typing import List, Dict, Any, Optional
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from tracer.schema import Trace, Metadata, Result, Step, SubAction, SnapshotInfo, Decision, Execution, Target, SemanticLocator, Verification
+from tracer.schema import Trace, Metadata, TraceResult, Step, SubAction, SnapshotInfo, Decision, Execution, Target, SemanticLocator, Verification
 
 class LogToTraceConverter:
     """
@@ -40,10 +40,22 @@ class LogToTraceConverter:
 
         i = 0
         last_snapshot_info = None
+        last_detected_url = "unknown (from log)"
         
         while i < len(lines):
             line = lines[i].strip()
             
+            # 0. 识别页面 URL (用于对齐回放状态)
+            # [OK] Batch 快照抓取成功 (URL: http://..., refs: 14)
+            url_match = re.search(r'Batch 快照抓取成功 \(URL: (.*?), refs: \d+\)', line)
+            if url_match:
+                last_detected_url = url_match.group(1).strip()
+                # 同时也更新 metadata 的起始 URL
+                if self.metadata.url == "Recovered from log":
+                    self.metadata.url = last_detected_url
+                i += 1
+                continue
+
             # 1. 识别大步骤开始
             # >>>> 开始执行步骤 1: 打开监管平台 <<<<
             step_match = re.search(r'>>>> 开始执行步骤 (\d+): (.*?) <<<<', line)
@@ -66,7 +78,7 @@ class LogToTraceConverter:
                 full_aria = "".join(aria_content).strip()
                 last_snapshot_info = SnapshotInfo(
                     snapshot_hash=f"h_{hash(full_aria) % 1000000}",
-                    page_url="unknown (from log)",
+                    page_url=last_detected_url,
                     title="unknown (from log)",
                     aria_text=full_aria # 恢复引擎能感知的 ARIA 树
                 )
@@ -151,7 +163,7 @@ class LogToTraceConverter:
             i += 1
 
         # 构建最终 Trace
-        trace_result = Result(
+        trace_result = TraceResult(
             status="pass" if all(s.verification and s.verification.result == "pass" for s in self.steps if s.verification) else "fail",
             confidence=0.9,
             error_message="Recovered from log"

@@ -61,26 +61,29 @@ def cleanup_browser_env(port=None, profile_name="browser_profile", logger=None, 
                 try: target_ports.append(int(port))
                 except: pass
             
-            # 停止浏览器和 Node 进程
-            process_names = ['node', 'chrome', 'msedge', 'chromedriver', 'msedgedriver', 'agent-browser']
-            # 使用逗号连接进程名，并增加 Try/Catch
-            plist_str = ",".join([f"'{p}'" for p in process_names])
-            ps_kill_procs = f'$plist = @({plist_str}) ; foreach($p in $plist) {{ Stop-Process -Name $p -Force -ErrorAction SilentlyContinue }}'
+            # A. 停止纯自动化工具进程 (不需要包含 chrome/msedge，防止误杀用户浏览器)
+            pure_automation_names = ['node', 'chromedriver', 'msedgedriver', 'agent-browser']
+            pn_list = ",".join([f"'{p}'" for p in pure_automation_names])
+            ps_kill_tools = f'$plist = @({pn_list}) ; foreach($p in $plist) {{ Stop-Process -Name $p -Force -ErrorAction SilentlyContinue }}'
             
-            # 清理端口占用 (增加精准打击)
+            # B. 精准停止带自动化 Profile 的浏览器进程 (通过命令行参数识别)
+            # 这里的 profile_name 默认为 browser_profile，它是所有自动化 Profile 的基准前缀
+            search_pattern = profile_name if profile_name else "browser_profile"
+            ps_kill_browsers = f'Get-CimInstance Win32_Process -Filter "Name = \'chrome.exe\' OR Name = \'msedge.exe\'" | Where-Object {{ $_.CommandLine -like "*{search_pattern}*" }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}'
+            
+            # C. 根据端口占用精准清理 (确保 3030/3031 对应的连接器彻底关闭)
             ps_kill_ports = ""
             for p in list(set(target_ports)):
-                # 这里不仅杀 OwningProcess，还尝试杀掉任何监听该端口的进程
                 ps_kill_ports += f'Get-NetTCPConnection -LocalPort {p} -ErrorAction SilentlyContinue | ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }} ; '
             
-            full_ps = f'{ps_kill_procs} ; {ps_kill_ports}'
+            full_ps = f'{ps_kill_tools} ; {ps_kill_browsers} ; {ps_kill_ports}'
             subprocess.run(['powershell', '-Command', full_ps], capture_output=True)
-            logger(f" [OK] 已尝试清理进程: {', '.join(process_names)} 及端口: {target_ports}")
+            logger(f" [OK] 已精准清理自动化进程 ({', '.join(pure_automation_names)}) 及匹配 Profile 的浏览器")
         else:
-            # Linux/Mac 
+            # Linux/Mac 简单处理 (由于通常是 headless 运行，误杀风险较小)
             subprocess.run(["pkill", "-9", "-f", "node"], capture_output=True)
-            subprocess.run(["pkill", "-9", "-f", "chrome"], capture_output=True)
-            subprocess.run(["pkill", "-9", "-f", "msedge"], capture_output=True)
+            # Linux/Mac 上可以通过 -f 匹配命令行参数
+            subprocess.run(["pkill", "-9", "-f", profile_name or "browser_profile"], capture_output=True)
     except Exception as e:
         logger(f" [Warn] 进程清理异常: {e}")
     
@@ -99,14 +102,13 @@ def cleanup_browser_env(port=None, profile_name="browser_profile", logger=None, 
             for p_path in glob.glob(pattern):
                 if os.path.isdir(p_path):
                     p_name = os.path.basename(p_path)
-                    logger(f" [Action] 正在清理 Profile: {p_name}...")
+                    logger(f" [Action] 正在清理 Profile: {p_name}...");
                     success = False
                     for i in range(5):
                         try:
+                            # 即使在 force_clean 下，也优先尝试精准杀掉占用该目录的进程
                             if sys.platform == "win32":
-                                subprocess.run(['taskkill', '/F', '/IM', 'chrome.exe', '/T'], capture_output=True)
-                                subprocess.run(['taskkill', '/F', '/IM', 'msedge.exe', '/T'], capture_output=True)
-                                subprocess.run(['powershell', '-Command', f'Get-Process | Where-Object {{$_.Path -like "*{p_name}*"}} | Stop-Process -Force'], capture_output=True)
+                                subprocess.run(['powershell', '-Command', f'Get-CimInstance Win32_Process | Where-Object {{$_.CommandLine -like "*{p_name}*"}} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}'], capture_output=True)
                             
                             time.sleep(i + 1)
                             shutil.rmtree(p_path)

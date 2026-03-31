@@ -8,6 +8,10 @@ import time
 import shutil
 import subprocess
 from datetime import datetime
+from dotenv import load_dotenv
+
+# 加载 .env 配置文件
+load_dotenv()
 from typing import Optional, List, Dict, Any
 
 # 把当前路径的外层加到 sys.path 用于之后真机引入模块
@@ -376,7 +380,7 @@ async def run_replay(trace_file: str, strict: bool = False, step_timeout: int = 
                     confidence=0.9, # 回放由于是确定的，置信度通常较高
                     error_message=result_summary["error"]
                 )
-                report_path = ReportGenerator.generate(trace)
+                report_path = ReportGenerator.generate(trace, logger=log_it)
                 log_it(f"✨ 测试报告已生成: {report_path}")
                 result_summary["report_path"] = report_path
             except Exception as e:
@@ -402,8 +406,9 @@ async def main():
             # 终端显示保留原样（如果支持颜色），但写入文件前必须过滤
             msg_str = str(msg)
             
-            # [Optimization] 增加全局 DEBUG 过滤开关
-            is_debug = msg_str.startswith("DEBUG:")
+            # [Optimization] 增加全局 DEBUG 过滤开关 (增强识别能力)
+            msg_upper = msg_str.strip().upper()
+            is_debug = msg_upper.startswith("DEBUG:") or "[DEBUG]" in msg_upper
             show_debug = os.environ.get("TEST_DEBUG") == "1"
             
             if not is_debug or show_debug:
