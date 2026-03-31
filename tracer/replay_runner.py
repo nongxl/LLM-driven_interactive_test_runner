@@ -12,7 +12,7 @@ from typing import Optional, List, Dict, Any
 # 把当前路径的外层加到 sys.path 用于之后真机引入模块
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tracer.schema import Trace
+from tracer.schema import Trace, TraceResult
 from core.action_executor import execute
 from core.snapshot_manager import get_snapshot
 from core.utils import cleanup_browser_env, resolve_trace_path, strip_ansi, S_OK, S_ERR, S_WARN, S_INFO
@@ -130,6 +130,18 @@ async def run_replay(trace_file: str, strict: bool = False, step_timeout: int = 
         log_it(f"\n--- 正在回放 Trace: {trace.metadata.trace_id} ---")
         log_it(f" [Trace File] {trace_file}")
         
+        # [NEW] 初始状态校验与同步导航
+        # 如果当前浏览器处于空状态 (about:blank)，自动跳转到 Trace 的初始入口 URL
+        try:
+            snapshot_init = await get_snapshot(logger=None)
+            current_url = snapshot_init.get('url', 'about:blank')
+            if current_url == 'about:blank' and trace.metadata.url:
+                log_it(f"  [Init] 浏览器处于空状态，正在自动导航至 Trace 起点: {trace.metadata.url}")
+                await execute({"action": "goto", "target": trace.metadata.url})
+                await asyncio.sleep(2)
+        except Exception as e:
+            log_it(f"  [WARN] 初始状态采集失败: {e}")
+
         for step in trace.steps:
             step_start = time.time()
             step_info = {"step_id": step.step_id, "instruction": step.instruction, "status": "pass", "error": None}
@@ -142,7 +154,35 @@ async def run_replay(trace_file: str, strict: bool = False, step_timeout: int = 
                 if getattr(sub, 'execution', None) and sub.execution.status != "success":
                     log_it(f"  [Skip] 跳过录制时失败的动作 (Sub-Action {sub_idx+1})")
                     continue
-                    
+                
+                # [NEW] 动作前 URL 状态对齐校验
+                # 检查录制此步骤时的 URL 是否与当前浏览器 URL 匹配
+                recorded_url = sub.snapshot_info.page_url
+                if recorded_url:
+                    try:
+                        # 快速检查当前状态
+                        check_snapshot = await get_snapshot(logger=None)
+                        current_url = check_snapshot.get('url', '')
+                        
+                        # 如果 URL 不匹配且当前不是 about:blank
+                        # (简单的字符串包含判断，兼容重定向后的微小差异)
+                        if current_url != 'about:blank' and recorded_url.split('?')[0].rstrip('/') != current_url.split('?')[0].rstrip('/'):
+                            log_it(f"  [Sync] 检测到页面状态偏移 (录制: {recorded_url} | 当前: {current_url})")
+                            log_it(f"  [Sync] 正在尝试等待页面同步 (3s)...")
+                            await asyncio.sleep(3)
+                            
+                            # 再次确认
+                            check_snapshot = await get_snapshot(logger=None)
+                            current_url = check_snapshot.get('url', '')
+                            if recorded_url.split('?')[0].rstrip('/') != current_url.split('?')[0].rstrip('/'):
+                                log_it(f"  {S_WARN} [Sync] 页面仍未对齐，正在强制修复状态至: {recorded_url}")
+                                await execute({"action": "goto", "target": recorded_url})
+                                await asyncio.sleep(2)
+                                # 强制刷新快照以更新 eID 映射关系
+                                await get_snapshot(logger=None)
+                    except Exception as sync_err:
+                        log_it(f"  [WARN] 状态对齐检查异常: {sync_err}")
+
                 try:
                     raw_action = getattr(sub.decision, 'raw_action', None)
                     if raw_action:
@@ -217,19 +257,16 @@ async def run_replay(trace_file: str, strict: bool = False, step_timeout: int = 
                     
                     log_it(f"  -> 执行: {res}")
                     
-                    # 健壮性改进：如果刚才执行的是 goto，强制触发一次快照，确保后端加载了元素 ID
-                    if action_name == "goto":
+                    # 健壮性改进：动作执行后，利用 agent-browser 的 wait_load 确保页面稳定
+                    if action_name in ("click", "goto", "type", "fill", "keyboard"):
                         try:
-                            # 显式等待以确保 CDP 识别到新 URL
-                            log_it("  [Sync] 正在同步页面状态...")
-                            await asyncio.sleep(3.0) 
-                            # 通过截图动作强制触发验证引擎的 Page 刷新与同步
-                            await execute({"action": "screenshot", "target": "artifacts/reports/screenshots/sync_after_goto.png"})
+                            # 强制等待网络空闲，确保下一条指令能找到元素
+                            await execute({"action": "wait_load", "value": "networkidle"})
                         except: pass
 
-                    if action_name == "goto": await asyncio.sleep(1.0)
-                    elif action_name == "click": await asyncio.sleep(2.0)
-                    else: await asyncio.sleep(1.0)
+                    if action_name == "goto": await asyncio.sleep(1.5)
+                    elif action_name == "click": await asyncio.sleep(1.0)
+                    else: await asyncio.sleep(0.5)
 
                 except Exception as e:
                     log_it(f"  {S_ERR} 错误: {e}")
@@ -287,8 +324,7 @@ async def run_replay(trace_file: str, strict: bool = False, step_timeout: int = 
         if generate_report:
             try:
                 log_it(f"\n{S_INFO} 正在生成由 AI 驱动的回放总结报告...")
-                # 重新对齐 Trace 实体的结果状态供报告器消费
-                from tracer.schema import TraceResult
+                # 使用已经在 schema.py 中重命名后的 TraceResult
                 trace.result = TraceResult(
                     status=result_summary["status"],
                     confidence=0.9, # 回放由于是确定的，置信度通常较高

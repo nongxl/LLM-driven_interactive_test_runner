@@ -58,8 +58,13 @@ async def run_test(test_file, pre_steps_override=None):
         sys.exit(1)
         
     trace_spec_id = os.path.splitext(os.path.basename(test_file))[0]
-    # 提前初始化 recorder
-    recorder = TraceRecorder(spec_id=trace_spec_id, url=test_file, agent_model="interactive")
+    
+    # [Fix] 调整初始化顺序：加载 YAML 以提取真正的起始 URL
+    with open(test_file, 'r', encoding='utf-8') as f:
+        test_case = yaml.safe_load(f)
+    
+    test_url = test_case.get('url', '')
+    recorder = TraceRecorder(spec_id=trace_spec_id, url=test_url, agent_model="interactive")
     test_passed = False
     execution_error = None
     log_file = None
@@ -103,11 +108,7 @@ async def run_test(test_file, pre_steps_override=None):
         from core.action_executor import execute
         from core.verification_engine import verify, get_playwright_page, close_verification_engine, initialize_verification_engine
         
-        with open(test_file, 'r', encoding='utf-8') as f:
-            test_case = yaml.safe_load(f)
-
         test_name = test_case.get('name', 'Unnamed Test')
-        recorder.trace.metadata.url = test_name 
         
         # [NEW] 解析 pre_steps (优先级: CLI Override > YAML 字段)
         pre_steps = pre_steps_override if pre_steps_override else test_case.get('pre_steps', [])

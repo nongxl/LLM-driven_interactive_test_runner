@@ -64,12 +64,12 @@ class Metadata(BaseModel):
     agent_model: str
     runner_version: str
 
-class Result(BaseModel):
+class TraceResult(BaseModel):
     status: Literal["pass", "fail", "pending"] = "pending"
     confidence: float = Field(0.0, ge=0.0, le=1.0)
     error_message: Optional[str] = None
 
 class Trace(BaseModel):
     metadata: Metadata
-    result: Result
+    result: TraceResult
     steps: List[Step] = Field(default_factory=list)

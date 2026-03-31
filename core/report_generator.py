@@ -47,6 +47,7 @@ class ReportGenerator:
         }
 
         # 2. 构造 AI 总结提示词并获取总结
+        print(f"  [Report] 正在请求 AI 总结测试业务要点 (URL: {m_url})...", flush=True)
         summary_content = ReportGenerator._get_ai_summary(trace)
 
         # 3. 构造 Markdown 内容
@@ -56,6 +57,7 @@ class ReportGenerator:
         with open(report_path, 'w', encoding='utf-8') as f:
             f.write(md_content)
         
+        print(f"  [Report] 报告生成成功: {report_path}", flush=True)
         return report_path
 
     @staticmethod
@@ -63,6 +65,13 @@ class ReportGenerator:
         """
         调用 LLM 对测试过程进行业务层面的总结
         """
+        from ai.llm_client import _get_api_config
+        api_key, _, _, _, _ = _get_api_config()
+        
+        if not api_key:
+            print("  [Report] [Skip] 未获取到 AI_API_KEY，跳过 AI 总结", flush=True)
+            return "### ⚠️ AI 总结不可用\n(未配置 AI_API_KEY，仅提供原始数据)"
+
         mission_steps = []
         findings = []
         

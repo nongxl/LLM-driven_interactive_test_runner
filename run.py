@@ -4,6 +4,10 @@ import subprocess
 import time
 import math
 import argparse
+from dotenv import load_dotenv
+
+# 加载 .env 配置文件
+load_dotenv()
 
 # --- 终端颜色定义 ---
 BLUE = "\033[94m"
@@ -139,9 +143,13 @@ def menu_exploratory():
     elif sub_choice == '4':
         pre_steps = "__MANUAL__"
 
-    # [NEW] 询问是否开启交互决策模式
-    print(f"\n{YELLOW}是否开启【交互决策模式】? (在探索过程中手动输入 JSON 指令){RESET}")
-    is_interactive = input(f"{BOLD}开启请按 y，默认不开启 (y/N): {RESET}").strip().lower() == 'y'
+    # [NEW] 询问是否开启交互决策模式 (如果 EXECUTION_MODE 已设置为 auto，则跳过)
+    exec_mode = os.getenv("EXECUTION_MODE", "").lower()
+    if exec_mode == "auto":
+        is_interactive = False
+    else:
+        print(f"\n{YELLOW}是否开启【交互决策模式】? (在探索过程中手动输入 JSON 指令){RESET}")
+        is_interactive = input(f"{BOLD}开启请按 y，默认不开启 (y/N): {RESET}").strip().lower() == 'y'
 
     cmd = ["python", "runner/exploratory_runner.py", url, steps]
     if pre_steps:
@@ -191,7 +199,7 @@ def menu_replay():
     trace = select_file(dir_path, [".json"], "选择轨迹文件")
     if not trace: return
     
-    strict = get_input("是否开启严格模式? (y/n)", "n")
+    strict = get_input("是否开启严格模式? (y/N)", "n")
     cmd = ["python", "tracer/replay_runner.py", trace]
     if strict.lower() == 'y': cmd.append("--strict")
     run_command(cmd)
@@ -325,7 +333,7 @@ def menu_smoke():
     elif sub_choice == '4':
         pre_steps = "__MANUAL__"
 
-    strict = get_input("是否开启严格模式 (遇错即停)? (y/n)", "n")
+    strict = get_input("是否开启严格模式 (遇错即停)? (y/N)", "n")
     cmd = ["python", "ci/run_smoke_tests.py"]
     if strict.lower() == 'y':
         cmd.append("--strict")

@@ -53,9 +53,10 @@ class ExplorationEngine:
         prompt = f"你是一个高级测试专家。请评估当前页面状态（URL: {url}）。\n" \
                  f"页面内容 (ARIA Tree):\n{aria_text}\n\n" \
                  f"请判断：\n" \
-                 f"1. 页面是否加载成功？\n" \
-                 f"2. 是否存在业务错误提示（如 404, 500, 权限不足, 登录失败）？\n" \
+                 f"1. 页面是否加载成功？注意识别浏览器原生错误页（如“无法访问此网站”、“404 Not Found”、“502 Bad Gateway”）。\n" \
+                 f"2. 是否存在业务错误提示（如 权限不足, 登录失败）？\n" \
                  f"3. 页面是否处于期望的业务流程中？\n\n" \
+                 f"注意：如果是浏览器级错误页或完全白屏，请务必返回 status: \"error\"。\n" \
                  f"返回 JSON 格式：\n" \
                  f"{{\"status\": \"healthy|error|unknown\", \"reason\": \"原因描述\", \"score\": 0.0-1.0}}"
         

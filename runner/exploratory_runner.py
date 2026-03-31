@@ -186,8 +186,34 @@ async def run_exploration(url, max_steps=30, pre_steps=None, interactive=False):
             # [V2] AI 智能健康检查
             log_it("🧠 AI 正在评估页面状态...")
             health = await engine.assess_page_health(snapshot)
-            log_it(f"📊 状态评估: {health.get('status', 'unknown')} ({health.get('reason', '')})")
+            h_status = health.get('status', 'unknown')
+            log_it(f"📊 状态评估: {h_status} ({health.get('reason', '')})")
             
+            # [Fix] 如果健康检查过程中触发了人工退出（如 AI 报错转人工后输入 exit）
+            if health.get('action') == 'force_exit':
+                log_it("🛑 人工指令：停止探索（在状态评估阶段）。")
+                break
+                
+            # [V3.3] 错误自愈逻辑：如果发现是错误页，尝试逃逸
+            if h_status == 'error' or "chrome-error://" in snapshot.get('url', ''):
+                page = await get_playwright_page()
+                if page:
+                    log_it("🛠️  检测到系统级错误或浏览器异常页，启动自愈程序...")
+                    # 尝试 1: 返回上一页
+                    log_it("  [Recovery] 尝试返回上一页 (Go Back)...")
+                    try:
+                        await page.go_back(timeout=5000)
+                        await asyncio.sleep(2)
+                        continue # 跳过本步决策，重新获取快照评估
+                    except Exception as ge:
+                        log_it(f"  [Recovery] 返回失败: {ge}")
+                    
+                    # 尝试 2: 如果返回无效，强制重置到起始 URL
+                    log_it(f"  [Recovery] 强制重定向至起始页: {url}")
+                    await execute({"action": "goto", "target": url})
+                    await asyncio.sleep(3)
+                    continue 
+
             # 4. 探索引擎决策
             decision = engine.decide_next_step(snapshot, memory, interactive=interactive)
             if not decision:
@@ -269,7 +295,9 @@ async def run_exploration(url, max_steps=30, pre_steps=None, interactive=False):
             for f in os.listdir(raw_dir):
                 if f.endswith(".json"):
                     with open(os.path.join(raw_dir, f), 'r', encoding='utf-8') as tf:
-                        traces.append(json.load(tf))
+                        trace_data = json.load(tf)
+                        if trace_data:
+                            traces.append(trace_data)
             
             if traces:
                 clusterer = TraceClusterer(threshold=0.7)

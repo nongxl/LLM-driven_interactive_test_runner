@@ -21,7 +21,7 @@ class TraceClusterer:
         for step in steps:
             sub_actions = step.get("sub_actions", [])
             for sub in sub_actions:
-                decision = sub.get("decision", {})
+                decision = (sub.get("decision") or {})
                 a_type = decision.get("action")
                 
                 # 提取目标：优先使用语义定位器，其次是 snapshot_id
@@ -86,7 +86,8 @@ class TraceClusterer:
             
             if best_match and max_sim >= self.threshold:
                 best_match["traces"].append(trace)
-                print(f"DEBUG: Trace {trace.get('metadata', {}).get('trace_id')[:8]} -> Cluster {best_match['cluster_id']} (Sim: {max_sim:.2f})")
+                t_id = (trace.get('metadata') or {}).get('trace_id', 'unknown')
+                print(f"DEBUG: Trace {t_id[:8]} -> Cluster {best_match['cluster_id']} (Sim: {max_sim:.2f})")
             else:
                 # 创建新 Cluster
                 new_id = f"cluster_{len(clusters) + 1}_{hashlib.md5(str(norm_seq).encode()).hexdigest()[:6]}"
@@ -105,7 +106,7 @@ class TraceClusterer:
                 "cluster_id": cluster["cluster_id"],
                 "trace_count": len(cluster["traces"]),
                 "representative": rep,
-                "all_trace_ids": [t.get("metadata", {}).get("trace_id") for t in cluster["traces"]]
+                "all_trace_ids": [(t.get("metadata") or {}).get("trace_id") for t in cluster["traces"]]
             })
             
         return {"clusters": final_clusters}
@@ -115,13 +116,13 @@ class TraceClusterer:
         挑选代表轨迹：优先级 pass > 短路径 > 高置信度。
         """
         def rank_key(t):
-            status = t.get("result", {}).get("status", "fail")
+            status = (t.get("result") or {}).get("status", "fail")
             # 状态分：pass 为 0，fail 为 1 (越小越优)
             status_score = 0 if status == "pass" else 1
             # 长度分：步骤数
             length_score = len(t.get("steps", []))
             # 置信度分：负置信度（越大信度越高，故负值越小越优）
-            conf_score = -t.get("result", {}).get("confidence", 0.0)
+            conf_score = -(t.get("result") or {}).get("confidence", 0.0)
             return (status_score, length_score, conf_score)
             
         sorted_traces = sorted(cluster_traces, key=rank_key)
@@ -135,7 +136,7 @@ class TraceClusterer:
             return {}
             
         last_step = trace["steps"][-1]
-        v_evidence = last_step.get("verification", {}).get("evidence", {})
+        v_evidence = (last_step.get("verification") or {}).get("evidence", {})
         
         # 简单推断逻辑
         if "url" in v_evidence:
@@ -155,8 +156,8 @@ class TraceClusterer:
             # 构造用例格式 (对齐 test_runner YAML 规范)
             smoke_test = {
                 "name": f"Smoke Test: {cluster['cluster_id']}",
-                "url": rep_trace.get("metadata", {}).get("url", ""),
-                "generated_from": rep_trace.get("metadata", {}).get("trace_id"),
+                "url": (rep_trace.get("metadata") or {}).get("url", ""),
+                "generated_from": (rep_trace.get("metadata") or {}).get("trace_id"),
                 "goal": self.infer_goal(rep_trace),
                 "steps": [s.get("instruction") for s in rep_trace.get("steps", [])]
             }

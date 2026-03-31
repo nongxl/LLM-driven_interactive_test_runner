@@ -65,7 +65,7 @@ def decide_action(messages: list, allow_interactive: bool = True) -> Dict[str, A
     api_key, base_url, model, mode, proxy = _get_api_config()
     
     if mode == "auto" and api_key:
-        return _decide_auto(messages, api_key, base_url, model, proxy)
+        return _decide_auto(messages, api_key, base_url, model, proxy, allow_interactive=allow_interactive)
     else:
         if not allow_interactive:
             return {"status": "unknown", "action": "wait", "value": "2000", "reason": "AI unavailable"}
@@ -110,7 +110,7 @@ def query_llm(messages: List[Dict[str, str]], json_mode: bool = False, proxy: st
 
         full_url = base_url.rstrip("/") + "/chat/completions"
         
-        response = session.post(full_url, headers=headers, json=payload, timeout=180)
+        response = session.post(full_url, headers=headers, json=payload, timeout=60)
         response.raise_for_status()
         
         res_json = response.json()
@@ -141,7 +141,8 @@ def query_llm(messages: List[Dict[str, str]], json_mode: bool = False, proxy: st
 
         # 实时输出推理过程 (如果环境变量开启且存在推理内容)
         # [v3.6] 默认关闭 (0)，保护 Token 成本且控制台精简
-        if reasoning and os.environ.get("SHOW_THOUGHTS", "0") != "0":
+        show_thoughts = int(os.environ.get("SHOW_THOUGHTS", "0"))
+        if reasoning and show_thoughts != 0:
             print(f"\n💭 [AI 逻辑推演]\n{reasoning}\n" + "-"*30)
 
         if "usage" in res_json:
@@ -159,14 +160,19 @@ def query_llm(messages: List[Dict[str, str]], json_mode: bool = False, proxy: st
             error_msg += f" (Detail: {e.response.text[:200]})"
         return f"Error: {error_msg}"
 
-def _decide_auto(messages: List[Dict[str, str]], api_key: str, base_url: str, model: str, proxy: str = None) -> Dict[str, Any]:
+def _decide_auto(messages: List[Dict[str, str]], api_key: str, base_url: str, model: str, proxy: str = None, allow_interactive: bool = True) -> Dict[str, Any]:
     """自动模式"""
-    print(f"🤖 [自动/思考模式] 正在请求推理决策 (Model: {model})...")
+    show_thoughts = int(os.environ.get("SHOW_THOUGHTS", "0"))
+    if show_thoughts != 0:
+        print(f"🤖 [自动/思考模式] 正在请求推理决策 (Model: {model})...")
     
     content = query_llm(messages, json_mode=True, proxy=proxy)
     if content.startswith("Error"):
         print(f"❌ 请求失败: {content}")
-        return _decide_interactive(messages)
+        if allow_interactive:
+            return _decide_interactive(messages)
+        else:
+            return {"status": "unknown", "action": "wait", "value": "2000", "reason": f"AI Error: {content}"}
 
     try:
         # 清理 Markdown 块
@@ -178,7 +184,10 @@ def _decide_auto(messages: List[Dict[str, str]], api_key: str, base_url: str, mo
         return decision
     except Exception as e:
         print(f"❌ JSON 解析失败: {str(e)}")
-        return _decide_interactive(messages)
+        if allow_interactive:
+            return _decide_interactive(messages)
+        else:
+            return {"status": "unknown", "action": "wait", "value": "2000", "reason": f"JSON Parse Error: {str(e)}"}
 
 def _decide_interactive(messages: list) -> Dict[str, Any]:
     """手动模式"""

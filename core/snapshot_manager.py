@@ -278,7 +278,13 @@ async def get_snapshot(logger=None, target_url=None):
             return {'aria_text': 'Timeout', 'raw': raw_output, 'global_alerts': global_alerts, 'snapshot_id': 'error'}
 
         snapshot_id = os.path.splitext(temp_filename)[0]
-        return {'aria_text': effective_snapshot, 'raw': raw_output, 'global_alerts': global_alerts, 'snapshot_id': snapshot_id}
+        return {
+            'aria_text': effective_snapshot, 
+            'raw': raw_output, 
+            'global_alerts': global_alerts, 
+            'snapshot_id': snapshot_id,
+            'url': current_page_url
+        }
 
     except Exception as e:
         log(f"快照组件异常: {str(e)}")
