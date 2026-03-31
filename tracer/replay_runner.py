@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import re
 import json
 import os
 import sys
@@ -15,6 +16,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tracer.schema import Trace, TraceResult
 from core.action_executor import execute
 from core.snapshot_manager import get_snapshot
+from core.verification_engine import initialize_verification_engine, get_playwright_page, verify, close_verification_engine
 from core.utils import cleanup_browser_env, resolve_trace_path, strip_ansi, S_OK, S_ERR, S_WARN, S_INFO
 from core.report_generator import ReportGenerator
 
@@ -90,6 +92,35 @@ async def find_element_by_semantic_locator(locator: Any) -> Optional[str]:
     except Exception as e:
         log_it(f"  [Auto-Healing] 匹配异常: {e}")
     return None
+
+async def _self_heal_popups(snapshot, log_it):
+    """
+    启发式弹窗自愈逻辑：回放时若遇到录制中未涵盖（如业务随机报错）的全局弹窗，尝试清理之。
+    """
+    aria_text = snapshot.get('aria_text', '')
+    global_alerts = snapshot.get('global_alerts', '')
+    if not global_alerts: return False
+
+    # 常见关闭/取消关键字
+    heal_keywords = ["关闭", "取消", "我知道了", "OK", "确定", "不再提示", "Close", "Cancel", "Confirm", "×"]
+    
+    found_ref = None
+    for kw in heal_keywords:
+        pattern = r'button\s+"[^"]*?' + re.escape(kw) + r'[^"]*?"\s+\[ref=(e\d+)\]'
+        match = re.search(pattern, aria_text, re.IGNORECASE)
+        if match:
+            found_ref = match.group(1)
+            log_it(f"{S_INFO} [自愈引擎] 回放中发现阻塞弹窗 '{kw}' (ref={found_ref})，尝试自动修复环境...")
+            break
+    
+    if found_ref:
+        from core.action_executor import execute
+        heal_action = {"action": "click", "target": found_ref}
+        await execute(heal_action)
+        await asyncio.sleep(1.0)
+        return True
+    
+    return False
 
 async def run_replay(trace_file: str, strict: bool = False, step_timeout: int = 10, close_engine: bool = True, logger=None, generate_report: bool = False) -> dict:
     """
@@ -180,8 +211,13 @@ async def run_replay(trace_file: str, strict: bool = False, step_timeout: int = 
                                 await asyncio.sleep(2)
                                 # 强制刷新快照以更新 eID 映射关系
                                 await get_snapshot(logger=None)
+                        
+                        # [NEW] 回放中的弹窗自愈：检查同步后的页面是否存在新出现的阻塞弹窗
+                        cur_snap = await get_snapshot(logger=None)
+                        await _self_heal_popups(cur_snap, log_it)
+
                     except Exception as sync_err:
-                        log_it(f"  [WARN] 状态对齐检查异常: {sync_err}")
+                        log_it(f"  [WARN] 状态同步逻辑异常: {sync_err}")
 
                 try:
                     raw_action = getattr(sub.decision, 'raw_action', None)
@@ -190,9 +226,21 @@ async def run_replay(trace_file: str, strict: bool = False, step_timeout: int = 
                     else:
                         log_it(f"  [Sub-Action {sub_idx+1}/{len(actions_to_run)}] {sub.decision.action}")
 
+                    # 解析动作
                     action_name = sub.decision.action
                     if action_name in ("navigate", "open"): 
                         action_name = "goto"
+
+                    if action_name == "assert":
+                        # 增强回放：实际执行验证
+                        log_it(f"  -> 执行验证: '{sub.decision.value}'")
+                        page = await get_playwright_page()
+                        v_res = await verify(page, {"type": "text_present", "value": sub.decision.value})
+                        if v_res['result'] != 'pass':
+                            log_it(f"  {S_WARN} 验证不匹配: {v_res['reason']}")
+                        else:
+                            log_it(f"  {S_OK} 验证已确认")
+                        continue
                         
                     target_val = ""
                     if action_name == "goto":
@@ -276,7 +324,6 @@ async def run_replay(trace_file: str, strict: bool = False, step_timeout: int = 
             
             # 如果中间动作没有 fail，则在动作全部完成后执行此统一的大步骤验证
             if step_info["status"] != "fail" and getattr(step, "expected", None):
-                from core.verification_engine import verify, get_playwright_page
                 log_it(f"  [Verify] 正在执行大步骤最终验证...", end="", flush=True)
                 page = await get_playwright_page()
                 if page:
@@ -316,7 +363,6 @@ async def run_replay(trace_file: str, strict: bool = False, step_timeout: int = 
         result_summary["error"] = f"Fatal replay error: {str(e)}"
     finally:
         if close_engine:
-            from core.verification_engine import close_verification_engine
             await close_verification_engine()
         result_summary["duration"] = round(time.time() - start_time, 2)
 
