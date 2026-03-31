@@ -4,6 +4,13 @@ import json
 import argparse
 from typing import List
 
+# 兼容 Windows 终端 Emoji 输出 (必须在任何 print 之前)
+if sys.platform == "win32":
+    import sys
+    import io
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        sys.stdout.reconfigure(encoding='utf-8')
+
 # Ensure project root is in path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 

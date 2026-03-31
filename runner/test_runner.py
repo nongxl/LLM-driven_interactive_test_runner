@@ -1,12 +1,56 @@
-import yaml
-import json
-import os
 import sys
+import os
 import asyncio
+import json
+import yaml
 from datetime import datetime
 
-# 确保脚本能找到 runner 和 ai 模块
+# 强制设置标准输出输出编码为 utf-8，解决 Windows 下的乱码问题
+if sys.stdout.encoding != 'utf-8':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except (AttributeError, Exception):
+        import io
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
+# 在导入 3rd party 库之前实现环境自引导逻辑
+def ensure_venv():
+    """
+    自引导逻辑：如果当前不在虚拟环境中且项目内存在 .venv，则自动切换。
+    """
+    if os.getenv("SKIP_BOOTSTRAP") == "1":
+        return
+
+    current_exe = sys.executable
+    if os.name == 'nt':
+        venv_python = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".venv", "Scripts", "python.exe"))
+    else:
+        venv_python = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".venv", "bin", "python"))
+
+    if os.path.exists(venv_python) and os.path.abspath(current_exe).lower() != venv_python.lower():
+        os.environ["SKIP_BOOTSTRAP"] = "1"
+        args = [venv_python] + sys.argv
+        if os.name == 'nt':
+            try:
+                sys.exit(subprocess.call(args))
+            except Exception as e:
+                print(f"❌ 自动环境切换失败: {e}")
+        else:
+            os.execv(venv_python, args)
+        sys.exit(0)
+
+import subprocess
+ensure_venv()
+
+# 确保脚本能找到 runner, tracer 和 ai 模块
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from dotenv import load_dotenv
+# 将 load_dotenv() 统一改为覆盖模式
+load_dotenv(override=True)
+
 
 from tracer.recorder import TraceRecorder
 from tracer.replay_runner import run_replay
@@ -87,7 +131,8 @@ async def run_test(test_file, pre_steps_override=None):
                 # 移除恢复专用的静默标签后再打印，保持控制台整洁且信息完整
                 display_msg = msg_str.replace("[Snapshot ARIA]", "").replace("[/Snapshot ARIA]", "").strip()
                 if display_msg:
-                    print(display_msg, flush=True)
+                    # 使用 errors='replace' 处理非法的 surrogate 字符
+                    print(display_msg.encode('utf-8', 'replace').decode('utf-8'), flush=True)
                 
             try:
                 # 2. 文件保存逻辑：记录原始消息（包含标签，用于轨迹恢复）
@@ -113,6 +158,7 @@ async def run_test(test_file, pre_steps_override=None):
         # [NEW] 解析 pre_steps (优先级: CLI Override > YAML 字段)
         pre_steps = pre_steps_override if pre_steps_override else test_case.get('pre_steps', [])
         final_steps = []
+        root_url = test_case.get('url') # 默认为主脚本 URL
         
         if isinstance(pre_steps, str):
             if pre_steps == "__MANUAL__":
@@ -144,6 +190,11 @@ async def run_test(test_file, pre_steps_override=None):
                         with open(pre_file, 'r', encoding='utf-8') as pf:
                             pre_case = yaml.safe_load(pf)
                             final_steps = pre_case.get('steps', [])
+                            # [Fix] 如果前置步骤中有定义 URL，则优先使用它作为其实跳转地址
+                            pre_url = pre_case.get('url')
+                            if pre_url:
+                                log_it(f"{S_INFO} [自愈] 发现前置脚本包含起始 URL: {pre_url}，将优先跳转至该页面。")
+                                root_url = pre_url
                 else:
                     log_it(f"{S_ERR} 错误: 找不到前置步骤文件: {pre_steps}")
         elif isinstance(pre_steps, list):
@@ -152,14 +203,19 @@ async def run_test(test_file, pre_steps_override=None):
         test_steps = final_steps + test_case.get('steps', [])
         test_goal = test_case.get('goal')
 
-        # 尽早初始化验证引擎
-        cleanup_browser_env(profile_name="browser_profile", logger=log_it)
-        await initialize_verification_engine()
-
+        test_name = test_case.get('name', 'Unnamed Test')
+        
         log_it(f"\n{'='*50}")
         log_it(f"测试名称: {test_name}")
         log_it(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         log_it(f"{'='*50}")
+
+        # 尽早初始化验证引擎
+        cleanup_browser_env(profile_name="browser_profile", logger=log_it)
+        if not await initialize_verification_engine(logger=log_it):
+            log_it(f"{S_ERR} 严重错误: 验证引擎初始化失败 (Playwright 无法建立与 3030 端口的 CDP 连接)。")
+            log_it(f"{S_INFO} 请检查是否有 agent-browser 僵尸进程残留，或尝试执行 'npx agent-browser --profile artifacts/browser_profile start' 手动拉起后重试。")
+            return
 
         if not test_steps:
             log_it(f"{S_WARN} 警告: 测试脚本中没有定义任何步骤。")
@@ -168,7 +224,6 @@ async def run_test(test_file, pre_steps_override=None):
             # [NEW] 初始导航引导：如果定义了 URL，且当前为空页，则自动进行首次跳转
             try:
                 page = await get_playwright_page()
-                root_url = test_case.get('url')
                 if page and (page.url == "about:blank" or page.url == "data:,") and root_url:
                     log_it(f"{S_INFO} [初始导航] 检测到浏览器处于空状态，正在自动跳转至起始 URL: {root_url}")
                     await page.goto(root_url, wait_until="networkidle", timeout=45000)
@@ -202,9 +257,10 @@ async def run_test(test_file, pre_steps_override=None):
                 recorder.begin_step(instruction=instruction, expected_dict=expected)
 
                 retry_count = 0
-                max_retries = 20
+                max_retries = 50
                 step_completed = False
                 step_start_snapshot = None
+                consecutive_failures = 0 # [v3.4] 连续底层故障计数器
                 
                 # 初始化单步上下文
                 from ai.prompt_builder import init_step_messages, append_snapshot
@@ -214,8 +270,14 @@ async def run_test(test_file, pre_steps_override=None):
                 while not step_completed and retry_count < max_retries:
                     # [v1.8 优化C] 移除 asyncio.sleep(2.0) 固定延迟
                     # 稳定性由 get_snapshot() 内部的 networkidle 智能等待承接
-                    # 1. 获取前置快照
-                    snapshot = await get_snapshot(logger=log_it)
+                    # 1. 获取前置快照 (增加静默心跳检测)
+                    try:
+                        snapshot = await asyncio.wait_for(get_snapshot(logger=log_it), timeout=60.0)
+                    except asyncio.TimeoutError:
+                        log_it(f"{S_WARN} 快照获取超过 60s 强制熔断，尝试自愈重连...")
+                        aria_text = "Timeout" 
+                        snapshot = {"aria_text": "Timeout"}
+                    
                     if not step_start_snapshot:
                         step_start_snapshot = snapshot
 
@@ -238,10 +300,23 @@ async def run_test(test_file, pre_steps_override=None):
                             # 自愈成功后，刷新快照以便 AI 在干净的环境下决策
                             snapshot = await get_snapshot(logger=log_it)
 
-                    if aria_text == 'Timeout':
+                    if aria_text == 'Timeout' or 'Error (code 1)' in aria_text:
                         retry_count += 1
-                        log_it(f" {S_WARN} 快照超时，重试中... ({retry_count}/{max_retries})")
+                        consecutive_failures += 1
+                        log_it(f" {S_WARN} 快照异常 (Timeout/Code1)，重试中... ({retry_count}/{max_retries})")
+                        
+                        # [v3.4] 每 3 次连续底层故障触发一次 CDP 重连
+                        if consecutive_failures >= 3:
+                            log_it(f"{S_INFO} [自愈] 检测到连续底层通信异常，尝试重新建立 CDP 隧道...")
+                            try:
+                                await close_verification_engine()
+                                await asyncio.sleep(2.0)
+                                await initialize_verification_engine(logger=log_it)
+                                consecutive_failures = 0
+                            except: pass
                         continue
+                    
+                    consecutive_failures = 0 # 成功获取快照，重置计数
 
                     # 2. 调用决策
                     append_snapshot(messages, snapshot)
@@ -260,7 +335,7 @@ async def run_test(test_file, pre_steps_override=None):
                             break # 跳出 while not step_completed 循环
 
                         messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
-                        log_it(f"AI 决策: {json.dumps(decision, ensure_ascii=False)}")
+                        log_it(f"AI 决策: {json.dumps(decision, ensure_ascii=True)}")
                         
                         # [v1.9.8] 核心数据安全性拦截 (Anti-Hallucination Interceptor)
                         # 支持对列表格式的批量检查
@@ -296,6 +371,18 @@ async def run_test(test_file, pre_steps_override=None):
                     result = await execute(decision)
                     # Python 的 time.time() 返回秒，无需再除，差值乘 1000
                     duration_ms = (recorder.start_action() - action_start_time) * 1000
+                    
+                    # [V3.5 状态同步补丁] 动态分配冷却时间：提交类点击给予更长刷新时间
+                    cool_down = 3.0
+                    action_info = main_action.get('action', '').lower()
+                    target_info = str(main_action.get('target', '')).lower()
+                    if action_info == "click" and any(k in target_info for k in ("submit", "pass", "through", "save", "confirm", "确定", "通过")):
+                        log_it(f"  [Synch] 关键业务提交，等待列表刷新同步 (4.0s)...")
+                        cool_down = 4.0
+                    elif action_info in ("type", "scroll", "hover"):
+                        cool_down = 1.0 # 非跳转类动作减少等待
+
+                    await asyncio.sleep(cool_down)
                     log_it(f"执行结果: {result}")
 
                     if is_auxiliary:
@@ -313,47 +400,87 @@ async def run_test(test_file, pre_steps_override=None):
                         
                     # ====== Trace 系统：准备语义定位器与记录动作 ======
                     if is_list:
-                        decision_to_record = [d.copy() for d in decision]
+                        # [Fix] 如果是批量动作，循环处理每一项以避免 'list' object has no attribute 'get' 报错
+                        for single_decision in decision:
+                            decision_to_record = single_decision.copy()
+                            
+                            target_id = single_decision.get('target')
+                            if target_id and isinstance(target_id, str) and target_id.startswith('e'):
+                                try:
+                                    raw_snapshot = json.loads(snapshot.get('raw', '{}'))
+                                    refs = raw_snapshot.get('data', {}).get('refs', {})
+                                    if target_id in refs:
+                                        ref_info = refs[target_id]
+                                        name_val = ref_info.get('name')
+                                        # Fallback: parse from aria_text if name is empty
+                                        if not name_val:
+                                            import re
+                                            aria_text = snapshot.get('aria_text', '')
+                                            match = re.search(r'"([^"]*?)"\s+\[ref=' + str(target_id) + r'\]', aria_text)
+                                            if match:
+                                                name_val = match.group(1)
+                                                
+                                        decision_to_record['target'] = {
+                                            "snapshot_id": target_id,
+                                            "semantic_locator": {
+                                                "role": ref_info.get('role'),
+                                                "name": name_val
+                                            }
+                                        }
+                                        log_it(f"  [Trace] 捕获语义属性: role='{ref_info.get('role')}', name='{name_val}'")
+                                except Exception as e:
+                                    log_it(f"  [Warn] 提取语义属性失败: {e}")
+
+                            try:
+                                recorder.record_sub_action(
+                                    pre_snapshot=snapshot,
+                                    decision_dict=decision_to_record,
+                                    exec_status=exec_status,
+                                    exec_error=exec_error,
+                                    duration_ms=duration_ms
+                                )
+                            except Exception as e:
+                                log_it(f"⚠️ Trace record error: {e}")
                     else:
                         decision_to_record = decision.copy()
                         
-                    target_id = main_action.get('target')
-                    if target_id and isinstance(target_id, str) and target_id.startswith('e'):
-                        try:
-                            raw_snapshot = json.loads(snapshot.get('raw', '{}'))
-                            refs = raw_snapshot.get('data', {}).get('refs', {})
-                            if target_id in refs:
-                                ref_info = refs[target_id]
-                                name_val = ref_info.get('name')
-                                # Fallback: parse from aria_text if name is empty
-                                if not name_val:
-                                    import re
-                                    aria_text = snapshot.get('aria_text', '')
-                                    match = re.search(r'"([^"]*?)"\s+\[ref=' + str(target_id) + r'\]', aria_text)
-                                    if match:
-                                        name_val = match.group(1)
-                                        
-                                decision_to_record['target'] = {
-                                    "snapshot_id": target_id,
-                                    "semantic_locator": {
-                                        "role": ref_info.get('role'),
-                                        "name": name_val
+                        target_id = main_action.get('target')
+                        if target_id and isinstance(target_id, str) and target_id.startswith('e'):
+                            try:
+                                raw_snapshot = json.loads(snapshot.get('raw', '{}'))
+                                refs = raw_snapshot.get('data', {}).get('refs', {})
+                                if target_id in refs:
+                                    ref_info = refs[target_id]
+                                    name_val = ref_info.get('name')
+                                    # Fallback: parse from aria_text if name is empty
+                                    if not name_val:
+                                        import re
+                                        aria_text = snapshot.get('aria_text', '')
+                                        match = re.search(r'"([^"]*?)"\s+\[ref=' + str(target_id) + r'\]', aria_text)
+                                        if match:
+                                            name_val = match.group(1)
+                                            
+                                    decision_to_record['target'] = {
+                                        "snapshot_id": target_id,
+                                        "semantic_locator": {
+                                            "role": ref_info.get('role'),
+                                            "name": name_val
+                                        }
                                     }
-                                }
-                                log_it(f"  [Trace] 捕获语义属性: role='{ref_info.get('role')}', name='{name_val}'")
-                        except Exception as e:
-                            log_it(f"  [Warn] 提取语义属性失败: {e}")
+                                    log_it(f"  [Trace] 捕获语义属性: role='{ref_info.get('role')}', name='{name_val}'")
+                            except Exception as e:
+                                log_it(f"  [Warn] 提取语义属性失败: {e}")
 
-                    try:
-                        recorder.record_sub_action(
-                            pre_snapshot=snapshot,
-                            decision_dict=decision_to_record,
-                            exec_status=exec_status,
-                            exec_error=exec_error,
-                            duration_ms=duration_ms
-                        )
-                    except Exception as e:
-                        log_it(f"⚠️ Trace record error: {e}")
+                        try:
+                            recorder.record_sub_action(
+                                pre_snapshot=snapshot,
+                                decision_dict=decision_to_record,
+                                exec_status=exec_status,
+                                exec_error=exec_error,
+                                duration_ms=duration_ms
+                            )
+                        except Exception as e:
+                            log_it(f"⚠️ Trace record error: {e}")
 
                     if exec_status == "failure":
                         retry_count += 1
@@ -515,4 +642,10 @@ if __name__ == "__main__":
     parser.add_argument("--pre-steps", help="Path to pre-steps YAML file or inline list (JSON string)", default=None)
     
     args = parser.parse_args()
-    asyncio.run(run_test(args.test_file, pre_steps_override=args.pre_steps))
+    try:
+        asyncio.run(run_test(args.test_file, pre_steps_override=args.pre_steps))
+    except KeyboardInterrupt:
+        print("\n[Manual Interrupt] 测试已由用户手动终止。正在清理并退出...")
+        # 即使被中断，逻辑层也已经同步了必要的日志与 Trace
+    except Exception as e:
+        print(f"\n[Fatal Error] 测试执行发生致命错误: {e}")

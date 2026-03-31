@@ -61,26 +61,35 @@ def cleanup_browser_env(port=None, profile_name="browser_profile", logger=None, 
                 try: target_ports.append(int(port))
                 except: pass
             
-            # 停止浏览器和 Node 进程
-            process_names = ['node', 'chrome', 'msedge', 'chromedriver', 'msedgedriver', 'agent-browser']
-            # 使用逗号连接进程名，并增加 Try/Catch
-            plist_str = ",".join([f"'{p}'" for p in process_names])
-            ps_kill_procs = f'$plist = @({plist_str}) ; foreach($p in $plist) {{ Stop-Process -Name $p -Force -ErrorAction SilentlyContinue }}'
+            # A. 快速清理：优先使用 taskkill 杀掉纯自动化工具进程（免去启动 PowerShell 的开销）
+            pure_automation_names = ['node.exe', 'chromedriver.exe', 'msedgedriver.exe', 'agent-browser.exe']
+            for name in pure_automation_names:
+                subprocess.run(['taskkill', '/F', '/IM', name, '/T'], capture_output=True, timeout=5)
             
-            # 清理端口占用 (增加精准打击)
+            # B. 精准停止：仅对带自动化 Profile 的浏览器使用 PowerShell 过滤 (增加 15s 强制超时)
+            # 这里的 profile_name 默认为 browser_profile
+            search_pattern = profile_name if profile_name else "browser_profile"
+            ps_kill_browsers = f'Get-CimInstance Win32_Process -Filter "Name = \'chrome.exe\' OR Name = \'msedge.exe\'" | Where-Object {{ $_.CommandLine -like "*{search_pattern}*" }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}'
+            
+            # C. 端口清理 (增加 15s 强制超时)
             ps_kill_ports = ""
             for p in list(set(target_ports)):
-                # 这里不仅杀 OwningProcess，还尝试杀掉任何监听该端口的进程
                 ps_kill_ports += f'Get-NetTCPConnection -LocalPort {p} -ErrorAction SilentlyContinue | ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }} ; '
             
-            full_ps = f'{ps_kill_procs} ; {ps_kill_ports}'
-            subprocess.run(['powershell', '-Command', full_ps], capture_output=True)
-            logger(f" [OK] 已尝试清理进程: {', '.join(process_names)} 及端口: {target_ports}")
+            full_ps = f'{ps_kill_browsers} ; {ps_kill_ports}'
+            try:
+                subprocess.run(['powershell', '-Command', full_ps], capture_output=True, timeout=15)
+                logger(f" [OK] 已完成进程清理与端口回收")
+            except subprocess.TimeoutExpired:
+                logger(f" [Warn] PowerShell 清理阶段由于超时 (15s) 被强制终止")
+            except KeyboardInterrupt:
+                logger(f" [Warn] 进程清理被用户手动中断")
+                raise
         else:
-            # Linux/Mac 
+            # Linux/Mac 简单处理 (由于通常是 headless 运行，误杀风险较小)
             subprocess.run(["pkill", "-9", "-f", "node"], capture_output=True)
-            subprocess.run(["pkill", "-9", "-f", "chrome"], capture_output=True)
-            subprocess.run(["pkill", "-9", "-f", "msedge"], capture_output=True)
+            # Linux/Mac 上可以通过 -f 匹配命令行参数
+            subprocess.run(["pkill", "-9", "-f", profile_name or "browser_profile"], capture_output=True)
     except Exception as e:
         logger(f" [Warn] 进程清理异常: {e}")
     
@@ -99,14 +108,13 @@ def cleanup_browser_env(port=None, profile_name="browser_profile", logger=None, 
             for p_path in glob.glob(pattern):
                 if os.path.isdir(p_path):
                     p_name = os.path.basename(p_path)
-                    logger(f" [Action] 正在清理 Profile: {p_name}...")
+                    logger(f" [Action] 正在清理 Profile: {p_name}...");
                     success = False
                     for i in range(5):
                         try:
+                            # 即使在 force_clean 下，也优先尝试精准杀掉占用该目录的进程
                             if sys.platform == "win32":
-                                subprocess.run(['taskkill', '/F', '/IM', 'chrome.exe', '/T'], capture_output=True)
-                                subprocess.run(['taskkill', '/F', '/IM', 'msedge.exe', '/T'], capture_output=True)
-                                subprocess.run(['powershell', '-Command', f'Get-Process | Where-Object {{$_.Path -like "*{p_name}*"}} | Stop-Process -Force'], capture_output=True)
+                                subprocess.run(['powershell', '-Command', f'Get-CimInstance Win32_Process | Where-Object {{$_.CommandLine -like "*{p_name}*"}} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}'], capture_output=True)
                             
                             time.sleep(i + 1)
                             shutil.rmtree(p_path)
@@ -135,4 +143,33 @@ def cleanup_browser_env(port=None, profile_name="browser_profile", logger=None, 
                 logger(f" [OK] artifacts/tmp 目录已清空")
             except Exception as e:
                 logger(f" [Warn] artifacts/tmp 清理失败: {e}")
+
+def is_port_alive(port):
+    """检测指定的本地 TCP 端口是否正在运行服务"""
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5) # 极快探测
+            return s.connect_ex(('127.0.0.1', int(port))) == 0
+    except:
+        return False
+
+def get_agent_browser_executable():
+    """获取 agent-browser 的可执行方案 (优先使用本项目 node_modules)"""
+    import os
+    # 路径 A: 项目根目录下的 node_modules/.bin (这也是 npx 默认会寻找的地方)
+    # 使用 os.getcwd() 确保是在用户运行 run.py 的位置寻找
+    local_bin_name = 'agent-browser.cmd' if os.name == 'nt' else 'agent-browser'
+    local_bin = os.path.join(os.getcwd(), 'node_modules', '.bin', local_bin_name)
+    
+    if os.path.exists(local_bin):
+        return f'"{os.path.abspath(local_bin)}"'
+    
+    # 路径 B: 如果 cwd 不在根目录，尝试相对于本文件所在位置向上找
+    alt_bin = os.path.join(os.path.dirname(__file__), '..', 'node_modules', '.bin', local_bin_name)
+    if os.path.exists(alt_bin):
+        return f'"{os.path.abspath(alt_bin)}"'
+
+    # 降级方案: npx (带 -y)
+    return 'npx.cmd -y' if os.name == 'nt' else 'npx -y'
 

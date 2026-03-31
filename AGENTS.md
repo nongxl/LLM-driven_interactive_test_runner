@@ -2,6 +2,18 @@
 
 本项目旨在实现一个“AI驱动的网页自动化测试执行器”，通过 `agent-browser` 的 snapshot 工作流，结合 LLM（大模型）的决策能力，完成自然语言描述的测试步骤。
 
+## 🚀 快速开始
+
+在运行 [run.py](file:///d:/workspace/LLM-driven_interactive_test_runner/run.py) 前，必须先激活虚拟环境以确保依赖可用：
+
+```powershell
+# 激活虚拟环境 (Windows)
+.\.venv\Scripts\activate.ps1
+
+# 运行交互式入口
+python run.py
+```
+
 ## 🏗️ 核心架构 (V3)
 
 - **编排层 (`runner/` & `tracer/`)**: 

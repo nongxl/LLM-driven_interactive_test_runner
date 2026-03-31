@@ -8,6 +8,49 @@ import time
 import shutil
 import subprocess
 from datetime import datetime
+
+# 强制设置标准输出输出编码为 utf-8，解决 Windows 下的乱码问题
+if sys.stdout.encoding != 'utf-8':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except (AttributeError, Exception):
+        import io
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
+# 在导入 3rd party 库之前实现环境自引导逻辑
+def ensure_venv():
+    """
+    自引导逻辑：如果当前不在虚拟环境中且项目内存在 .venv，则自动切换。
+    """
+    if os.getenv("SKIP_BOOTSTRAP") == "1":
+        return
+
+    current_exe = sys.executable
+    if os.name == 'nt':
+        venv_python = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".venv", "Scripts", "python.exe"))
+    else:
+        venv_python = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".venv", "bin", "python"))
+
+    if os.path.exists(venv_python) and os.path.abspath(current_exe).lower() != venv_python.lower():
+        os.environ["SKIP_BOOTSTRAP"] = "1"
+        args = [venv_python] + sys.argv
+        if os.name == 'nt':
+            try:
+                sys.exit(subprocess.call(args))
+            except Exception as e:
+                print(f"❌ 自动环境切换失败: {e}")
+        else:
+            os.execv(venv_python, args)
+        sys.exit(0)
+
+import subprocess
+ensure_venv()
+
+from dotenv import load_dotenv
+# 加载 .env 配置文件
+load_dotenv()
 from typing import Optional, List, Dict, Any
 
 # 把当前路径的外层加到 sys.path 用于之后真机引入模块
@@ -376,7 +419,7 @@ async def run_replay(trace_file: str, strict: bool = False, step_timeout: int = 
                     confidence=0.9, # 回放由于是确定的，置信度通常较高
                     error_message=result_summary["error"]
                 )
-                report_path = ReportGenerator.generate(trace)
+                report_path = ReportGenerator.generate(trace, logger=log_it)
                 log_it(f"✨ 测试报告已生成: {report_path}")
                 result_summary["report_path"] = report_path
             except Exception as e:
@@ -402,8 +445,9 @@ async def main():
             # 终端显示保留原样（如果支持颜色），但写入文件前必须过滤
             msg_str = str(msg)
             
-            # [Optimization] 增加全局 DEBUG 过滤开关
-            is_debug = msg_str.startswith("DEBUG:")
+            # [Optimization] 增加全局 DEBUG 过滤开关 (增强识别能力)
+            msg_upper = msg_str.strip().upper()
+            is_debug = msg_upper.startswith("DEBUG:") or "[DEBUG]" in msg_upper
             show_debug = os.environ.get("TEST_DEBUG") == "1"
             
             if not is_debug or show_debug:

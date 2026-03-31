@@ -1,11 +1,9 @@
 node_modules
-test_specs/check_navigator_links.yaml
-test_specs/login.yaml
-test_specs/pre_login.yaml
-常用命令.txt
+test_specs/*.yaml
 .venv
 artifacts/*
 .env
 .env.local
 *.log
 .browser_profile*
+常用命令.txt

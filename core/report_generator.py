@@ -2,6 +2,13 @@ import os
 import json
 from datetime import datetime
 from ai.llm_client import query_llm, get_current_token_usage
+from core.utils import S_ERR, S_OK, S_INFO
+import sys
+import io
+
+# 兼容 Windows 终端 Emoji 输出
+if sys.platform == "win32" and isinstance(sys.stdout, io.TextIOWrapper):
+    sys.stdout.reconfigure(encoding='utf-8')
 
 class ReportGenerator:
     """
@@ -9,10 +16,11 @@ class ReportGenerator:
     负责将 Trace 交互轨迹转化为由 AI 总结的业务测试报告
     """
     @staticmethod
-    def generate(trace, log_file=None, output_dir="artifacts/reports"):
+    def generate(trace, log_file=None, output_dir="artifacts/reports", logger=None):
         """
         生成完整的 Markdown 报告
         """
+        log = logger if logger else print
         os.makedirs(output_dir, exist_ok=True)
         # 兼容处理 spec_id
         spec_id = "unknown"
@@ -47,8 +55,8 @@ class ReportGenerator:
         }
 
         # 2. 构造 AI 总结提示词并获取总结
-        print(f"  [Report] 正在请求 AI 总结测试业务要点 (URL: {m_url})...", flush=True)
-        summary_content = ReportGenerator._get_ai_summary(trace)
+        log(f"  [Report] 正在请求 AI 总结测试业务要点 (URL: {m_url})...", flush=True)
+        summary_content = ReportGenerator._get_ai_summary(trace, logger=log)
 
         # 3. 构造 Markdown 内容
         md_content = ReportGenerator._build_md(stats, summary_content, trace)
@@ -57,19 +65,20 @@ class ReportGenerator:
         with open(report_path, 'w', encoding='utf-8') as f:
             f.write(md_content)
         
-        print(f"  [Report] 报告生成成功: {report_path}", flush=True)
+        log(f"  [Report] 报告生成成功: {report_path}", flush=True)
         return report_path
 
     @staticmethod
-    def _get_ai_summary(trace):
+    def _get_ai_summary(trace, logger=None):
         """
         调用 LLM 对测试过程进行业务层面的总结
         """
         from ai.llm_client import _get_api_config
         api_key, _, _, _, _ = _get_api_config()
+        log = logger if logger else print
         
         if not api_key:
-            print("  [Report] [Skip] 未获取到 AI_API_KEY，跳过 AI 总结", flush=True)
+            log("  [Report] [Skip] 未获取到 AI_API_KEY，跳过 AI 总结", flush=True)
             return "### ⚠️ AI 总结不可用\n(未配置 AI_API_KEY，仅提供原始数据)"
 
         mission_steps = []
@@ -115,9 +124,22 @@ class ReportGenerator:
             {"role": "user", "content": user_prompt}
         ]
         
-        summary = query_llm(messages)
+        # 总结类任务是非关键动作，使用较短的超时(60s)和少量重试(2)，避免回放结束后死等
+        summary = query_llm(messages, logger=log, timeout=60, max_retries=2)
         if summary.startswith("Error"):
-            return "### ⚠️ AI 总结不可用\n(API 调用失败，请检查配置)"
+            log(f"  {S_ERR} [Report] AI 总结失败: {summary}")
+            return f"""
+### ⚠️ AI 总结不可用
+> [!WARNING]
+> **API 调用失败**
+> 
+> **原因**: `{summary}`
+> 
+> **建议**: 
+> 1. 检查 `.env` 中的 `AI_API_KEY` 是否有效。
+> 2. 检查 `.env` 中的 `AI_PROXY` ({os.getenv("AI_PROXY", "未设置")}) 是否运行正常。
+> 3. 检查 `.env` 中的 AI_MODEL=gemini-2.5-flash-lite ({os.getenv("AI_MODEL", "unknown")}) 名称是否正确。
+"""
         return summary
 
     @staticmethod

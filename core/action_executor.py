@@ -4,14 +4,10 @@ import json
 import subprocess
 from datetime import datetime
 from core.ocr_helper import recognize_captcha
-from core.utils import strip_ansi, S_OK, S_ERR, S_WARN, S_INFO
+from core.utils import strip_ansi, S_OK, S_ERR, S_WARN, S_INFO, get_agent_browser_executable
 
-# agent-browser 本地安装路径，优先使用 node_modules 中的二进制文件
-LOCAL_BIN = os.path.join(os.path.dirname(__file__), '..', 'node_modules', '.bin', 'agent-browser.cmd' if os.name == 'nt' else 'agent-browser')
-if os.path.exists(LOCAL_BIN):
-    AGENT_BROWSER_CMD = f'"{os.path.abspath(LOCAL_BIN)}"'
-else:
-    AGENT_BROWSER_CMD = 'npx.cmd' if os.name == 'nt' else 'npx'
+# 使用统一的 agent-browser 探测方案
+AGENT_BROWSER_CMD = get_agent_browser_executable()
 
 def _project_root():
     """返回项目根目录（package.json 所在位置）"""
@@ -24,9 +20,13 @@ async def _run(cmd_args):
     """
     env = os.environ.copy()
     env['AGENT_BROWSER_HEADED'] = 'true'
-    env['AGENT_BROWSER_PORT'] = os.getenv('AGENT_BROWSER_PORT', '3031')
+    env['AGENT_BROWSER_PORT'] = os.getenv('AGENT_BROWSER_PORT', '3030')
     
-    profile_name = os.getenv('AGENT_BROWSER_PROFILE', 'browser_profile_replay')
+    # [Fix] 清理代理环境变量，防止干扰浏览器访问内部或特定网站
+    for p_var in ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'all_proxy', 'ALL_PROXY']:
+        if p_var in env: del env[p_var]
+
+    profile_name = os.getenv('AGENT_BROWSER_PROFILE', 'browser_profile')
     profile_path = os.path.join(os.getcwd(), 'artifacts', profile_name)
     
     # [Fix] 构造完整命令字符串
@@ -41,62 +41,57 @@ async def _run(cmd_args):
     max_retries = 3
     for attempt in range(1, max_retries + 1):
         try:
-            # [Fix] 切换为同步阻塞调用，避免 asyncio 在 Windows 下处理子进程时的异常崩溃
-            import subprocess
-            proc = subprocess.run(
+            # [V3.1 深度异步化] 启用异步子进程，确保事件循环不被阻塞，Ctrl+C 可随时生效
+            proc = await asyncio.create_subprocess_shell(
                 cmd_str,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
                 cwd=_project_root(),
-                env=env,
-                shell=True,
-                text=True,
-                encoding='utf-8',
-                errors='ignore',
-                timeout=45.0
+                env=env
             )
             
-            stdout = proc.stdout.strip()
-            stderr = proc.stderr.strip()
+            try:
+                # 使用 wait_for 实现带有超时的异步通信
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=90.0)
+                stdout_str = stdout.decode('utf-8', errors='ignore').strip()
+                stderr_str = stderr.decode('utf-8', errors='ignore').strip()
                 
-            # 处理输出，过滤 ANSI 并合并
-            clean_stdout = strip_ansi(stdout)
-            clean_stderr = strip_ansi(stderr)
-            all_output = (clean_stdout + "\n" + clean_stderr).strip()
-            
-            # [Optimization] 精准处理 10048 端口占用
-            # 只有在返回码非 0（真正无法执行）时才进行避让重试
-            if proc.returncode != 0 and ("10048" in all_output or "Address already in use" in all_output or "只允许使用一次" in all_output):
-                if attempt < max_retries:
-                    import random
-                    wait_sec = 2.0 + random.random() * 2.0
-                    print(f"  [WARN] 动作执行检测到端口冲突 (真正的 10048 失败)，正在进行第 {attempt} 次避让重试 ({wait_sec:.1f}s)...", flush=True)
-                    await asyncio.sleep(wait_sec)
-                    continue
+                # 处理输出，过滤 ANSI 并合并
+                clean_stdout = strip_ansi(stdout_str)
+                clean_stderr = strip_ansi(stderr_str)
+                all_output = (clean_stdout + "\n" + clean_stderr).strip()
+                
+                # [Optimization] 精准处理 10048 端口占用
+                if proc.returncode != 0 and ("10048" in all_output or "Address already in use" in all_output or "只允许使用一次" in all_output):
+                    if attempt < max_retries:
+                        import random
+                        wait_sec = 2.0 + random.random() * 2.0
+                        print(f"  [WARN] 动作执行检测到端口冲突，正在进行第 {attempt} 次避让重试 ({wait_sec:.1f}s)...", flush=True)
+                        await asyncio.sleep(wait_sec)
+                        continue
 
-            # 过滤掉冗余的 daemon running 警告以及成功的 10048 探测警告
-            noise_patterns = [
-                "--profile, --ignore-https-errors ignored: daemon already running",
-                "⚠ --profile, --ignore-https-errors ignored: daemon already running",
-                "Address already in use",
-                "10048",
-                "只允许使用一次",
-                "os error 10048"
-            ]
-            
-            lines = all_output.split('\n')
-            clean_lines = []
-            for line in lines:
-                if not any(pattern in line for pattern in noise_patterns):
-                    clean_lines.append(line)
-            all_output = "\n".join(clean_lines).strip()
-            
-            if proc.returncode != 0:
-                return f"{S_ERR} Error (code {proc.returncode}): {all_output}"
-            
-            return all_output
-        except subprocess.TimeoutExpired:
-            return f"{S_ERR} Error: Command timed out after 45s."
+                # 过滤噪音 patrones
+                noise_patterns = ["daemon already running", "Address already in use", "10048", "只允许使用一次", "os error 10048"]
+                lines = all_output.split('\n')
+                clean_lines = [line for line in lines if not any(pattern in line for pattern in noise_patterns)]
+                all_output = "\n".join(clean_lines).strip()
+                
+                if proc.returncode != 0:
+                    return f"{S_ERR} Error (code {proc.returncode}): {all_output}"
+                
+                return all_output
+
+            except asyncio.TimeoutError:
+                try: proc.kill()
+                except: pass
+                return f"{S_ERR} Error: 指令执行超时 (45s)"
+
+        except asyncio.CancelledError:
+            # 高效捕获用户中断 (Ctrl+C)
+            if 'proc' in locals():
+                try: proc.kill()
+                except: pass
+            raise
         except Exception as e:
             if attempt < max_retries:
                 await asyncio.sleep(1.0)
@@ -251,7 +246,15 @@ async def execute(action):
             result_text = recognize_captcha(full_path, box_data)
             return f"{S_OK} OCR Result for {target}: {result_text}"
 
-        # 13. 断言 (逻辑标记)
+        # 13. 文件上传 (绕过 OS 弹窗)
+        elif action_type == 'upload':
+            # 确保路径中的反斜杠被正确处理
+            file_path = str(value).replace('\\', '/')
+            res = await _run(['upload', target, file_path])
+            if is_failed(res): return res
+            return f"{S_OK} File uploaded to {target}: {file_path}"
+
+        # 14. 断言 (逻辑标记)
         elif action_type == 'assert':
             return f"Assert checkpoint: '{value}'"
 

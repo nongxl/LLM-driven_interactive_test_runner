@@ -6,8 +6,50 @@ import time
 from datetime import datetime
 from typing import Optional
 
-# Ensure project root is in path
+# 强制设置标准输出输出编码为 utf-8，解决 Windows 下的乱码问题
+if sys.stdout.encoding != 'utf-8':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except (AttributeError, Exception):
+        import io
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
+# 在导入 3rd party 库之前实现环境自引导逻辑
+def ensure_venv():
+    """
+    自引导逻辑：如果当前不在虚拟环境中且项目内存在 .venv，则自动切换。
+    """
+    if os.getenv("SKIP_BOOTSTRAP") == "1":
+        return
+
+    current_exe = sys.executable
+    if os.name == 'nt':
+        venv_python = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".venv", "Scripts", "python.exe"))
+    else:
+        venv_python = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".venv", "bin", "python"))
+
+    if os.path.exists(venv_python) and os.path.abspath(current_exe).lower() != venv_python.lower():
+        os.environ["SKIP_BOOTSTRAP"] = "1"
+        args = [venv_python] + sys.argv
+        if os.name == 'nt':
+            try:
+                sys.exit(subprocess.call(args))
+            except Exception as e:
+                print(f"❌ 自动环境切换失败: {e}")
+        else:
+            os.execv(venv_python, args)
+        sys.exit(0)
+
+import subprocess
+ensure_venv()
+
+# 确保项目根目录在 path 中，以便导入 core, tracer, ai 等模块
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from dotenv import load_dotenv
+load_dotenv()
 
 from core.exploration_engine import ExplorationEngine
 from core.state_memory import StateMemory
@@ -141,13 +183,24 @@ async def run_exploration(url, max_steps=30, pre_steps=None, interactive=False):
     from core.utils import cleanup_browser_env, strip_ansi
 
     def log_it(msg):
-        msg_str = str(msg)
-        # [Optimization] 增加全局 DEBUG 过滤开关
-        is_debug = msg_str.startswith("DEBUG:")
+        msg_str = str(msg).strip()
+        # [Optimization] 增加更鲁棒的全局 DEBUG 过滤开关
+        msg_upper = msg_str.upper()
+        is_debug = "DEBUG:" in msg_upper or msg_upper.startswith("WAIT ") or msg_upper.startswith("BATCH ")
         show_debug = os.environ.get("TEST_DEBUG") == "1"
         
+        # 1. 控制台输出逻辑
         if not is_debug or show_debug:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg_str}", flush=True)
+            
+        try:
+            # 2. 文件保存逻辑
+            clean_msg = strip_ansi(msg_str)
+            with open(log_file_path, 'a', encoding='utf-8') as f:
+                f.write(clean_msg + "\n")
+                f.flush()
+        except Exception:
+            pass
         try:
             clean_msg = strip_ansi(msg_str)
             with open(log_file_path, 'a', encoding='utf-8') as f:

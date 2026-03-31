@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
-from .schema import Trace, Metadata, Result, Step, SubAction, SnapshotInfo, Decision, Execution, Target, SemanticLocator, Verification, Expected
+from .schema import Trace, Metadata, TraceResult, Step, SubAction, SnapshotInfo, Decision, Execution, Target, SemanticLocator, Verification, Expected
 
 class TraceRecorder:
     def __init__(self, spec_id: str, url: str, agent_model: str = "unknown", runner_version: str = "1.0.0"):
@@ -19,7 +19,7 @@ class TraceRecorder:
             agent_model=agent_model,
             runner_version=runner_version
         )
-        self.trace = Trace(metadata=metadata, result=Result())
+        self.trace = Trace(metadata=metadata, result=TraceResult())
         self.current_step: Optional[Step] = None
         
     def begin_step(self, instruction: str, expected_dict: Optional[Dict[str, Any]] = None):
@@ -152,11 +152,13 @@ class TraceRecorder:
             
             filepath = os.path.join(directory, filename)
             
-            # 如果是最终保存，且存在之前的 partial 文件，尝试清理它
+            # 如果是最终保存，且存在之前的任何 partial 文件，尝试清理它们
             if not is_partial:
-                partial_path = filepath.replace(".json", "_partial.json")
-                if os.path.exists(partial_path):
-                    try: os.remove(partial_path)
+                import glob
+                # 无论之前的状态是 pass/fail/pending，清理所有匹配 spec_id 和 time_str 的增量文件
+                partial_pattern = os.path.join(directory, f"trace_{self.spec_id}_{time_str}_*_partial.json")
+                for p_f in glob.glob(partial_pattern):
+                    try: os.remove(p_f)
                     except: pass
 
             with open(filepath, 'w', encoding='utf-8') as f:

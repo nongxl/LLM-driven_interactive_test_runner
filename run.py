@@ -1,9 +1,67 @@
+# coding:utf8
 import os
 import sys
 import subprocess
 import time
 import math
 import argparse
+
+# 强制设置标准输出输出编码为 utf-8，解决 Windows 下的乱码问题
+if sys.stdout.encoding != 'utf-8':
+    try:
+        # Python 3.7+ 支持的 reconfigure
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+        if sys.stdin: sys.stdin.reconfigure(encoding='utf-8')
+    except (AttributeError, Exception):
+        # 降级处理
+        import io
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+        if sys.stdin: sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8')
+
+# 在导入 3rd party 库之前实现环境自引导逻辑
+def ensure_venv():
+    """
+    自引导逻辑：如果当前不在虚拟环境中且项目内存在 .venv，则自动切换。
+    """
+    # 允许通过环境变量禁用自引导 (防止递归/特殊 CI 环境)
+    if os.getenv("SKIP_BOOTSTRAP") == "1":
+        return
+
+    # 获取当前解释器路径
+    current_exe = sys.executable
+    
+    # 定义项目内的虚拟环境路径
+    if os.name == 'nt':
+        venv_python = os.path.abspath(os.path.join(os.path.dirname(__file__), ".venv", "Scripts", "python.exe"))
+    else:
+        venv_python = os.path.abspath(os.path.join(os.path.dirname(__file__), ".venv", "bin", "python"))
+
+    # 如果虚拟环境存在，且当前不是该环境的解释器，则重启自身
+    if os.path.exists(venv_python) and os.path.abspath(current_exe).lower() != venv_python.lower():
+        # 设置标记防止无限重启 (虽然 os.execv 替换进程通常没问题，但标记更稳健)
+        os.environ["SKIP_BOOTSTRAP"] = "1"
+        
+        # 构造参数：必须包含解释器路径作为第一个参数
+        args = [venv_python] + sys.argv
+        
+        # 执行重启
+        if os.name == 'nt':
+            # [Fix] Windows 下 os.execv 会导致父进程立即退出并失去终端控制权
+            # 使用 subprocess.call 保持父进程存活，代理标准输入输出
+            try:
+                sys.exit(subprocess.call(args))
+            except Exception as e:
+                print(f"❌ 自动环境切换失败: {e}")
+        else:
+            os.execv(venv_python, args)
+        
+        sys.exit(0)
+
+# 执行环境自引导
+ensure_venv()
+
 from dotenv import load_dotenv
 
 # 加载 .env 配置文件
@@ -18,16 +76,28 @@ BOLD = "\033[1m"
 RESET = "\033[0m"
 
 def clear_screen():
+    if os.getenv("NO_CLEAR") == "1":
+        return
     os.system('cls' if os.name == 'nt' else 'clear')
 
 def print_header(subtitle=None):
-    print(f"{BLUE}{BOLD}")
-    print("="*60)
-    print("      🚀 LLM-driven Interactive Test Runner V3        ")
-    if subtitle:
-        print(f"      > {subtitle}")
-    print("="*60)
-    print(f"{RESET}")
+    try:
+        print(f"{BLUE}{BOLD}")
+        print("="*60)
+        print("      🚀 LLM-driven Interactive Test Runner V3        ")
+        if subtitle:
+            print(f"      > {subtitle}")
+        print("="*60)
+        print(f"{RESET}")
+    except UnicodeEncodeError:
+        # 兼容不支持 Emoji 的终端 (如 Windows GBK)
+        print(f"{BLUE}{BOLD}")
+        print("="*60)
+        print("      [INIT] LLM-driven Interactive Test Runner V3        ")
+        if subtitle:
+            print(f"      > {subtitle}")
+        print("="*60)
+        print(f"{RESET}")
 
 def get_input(prompt, default=None):
     if default:
@@ -55,7 +125,7 @@ def select_file(directory, extensions=None, title="选择文件"):
     files.sort()
     
     if not files:
-        print(f"{YELLOW}⚠️  目录 {directory} 下没有匹配的文件。{RESET}")
+        print(f"{YELLOW}[!] 目录 {directory} 下没有匹配的文件。{RESET}")
         time.sleep(1)
         return None
 
@@ -91,10 +161,10 @@ def select_file(directory, extensions=None, title="选择文件"):
                 selected_file = page_files[idx - 1]
                 return os.path.join(directory, selected_file)
             else:
-                print(f"{RED}⚠️  无效序号，请重新选择。{RESET}")
+                print(f"{RED}[!] 无效序号，请重新选择。{RESET}")
                 time.sleep(0.5)
         else:
-            print(f"{RED}⚠️  无效输入。{RESET}")
+            print(f"{RED}[!] 无效输入。{RESET}")
             time.sleep(0.5)
 
 def run_command(cmd_list, wait_at_end=True):
@@ -110,7 +180,8 @@ def run_command(cmd_list, wait_at_end=True):
         result = subprocess.run(cmd_list)
         success = (result.returncode == 0)
     except KeyboardInterrupt:
-        print(f"\n{RED}[中断] 用户取消了执行。{RESET}")
+        print(f"\n{RED}[中断] 用户取消了子任务执行。{RESET}")
+        success = False
     except Exception as e:
         print(f"\n{RED}[错误] 执行失败: {e}{RESET}")
     
@@ -129,7 +200,7 @@ def menu_exploratory():
     print("  1. test_specs (YAML)")
     print("  2. artifacts/smoke_tests (YAML/JSON)")
     print("  3. artifacts/traces/raw (JSON)")
-    print("  4. ✋ 手工自由操作 (Manual Mode)")
+    print("  4. [M] 手工自由操作 (Manual Mode)")
     print("  0. 跳过")
     sub_choice = input(f"{BOLD}请选择 (0-4): {RESET}").strip()
     
@@ -172,7 +243,7 @@ def menu_scripted():
     print("  1. test_specs (YAML)")
     print("  2. artifacts/smoke_tests (YAML/JSON)")
     print("  3. artifacts/traces/raw (JSON)")
-    print("  4. ✋ 手工自由操作 (Manual Mode)")
+    print("  4. [M] 手工自由操作 (Manual Mode)")
     print("  0. 跳过")
     pre_choice = input(f"{BOLD}请选择 (0-4): {RESET}").strip()
     
@@ -231,7 +302,7 @@ def menu_batch():
     files.sort()
 
     if not files:
-        print(f"{RED}❌ 目录 {target_dir} 下没有类型为 {ext} 的文件。{RESET}")
+        print(f"{RED}[X] 目录 {target_dir} 下没有类型为 {ext} 的文件。{RESET}")
         time.sleep(1)
         return
 
@@ -242,7 +313,7 @@ def menu_batch():
         print("  1. test_specs (YAML)")
         print("  2. artifacts/smoke_tests (YAML/JSON)")
         print("  3. artifacts/traces/raw (JSON)")
-        print("  4. ✋ 手工自由操作 (Manual Mode)")
+        print("  4. [M] 手工自由操作 (Manual Mode)")
         print("  0. 跳过")
         p_choice = input(f"{BOLD}请选择 (0-4): {RESET}").strip()
         
@@ -310,7 +381,7 @@ def menu_smoke():
     
     smoke_dir = "artifacts/smoke_tests"
     if not os.path.exists(smoke_dir) or not any(f.endswith(".json") for f in os.listdir(smoke_dir)):
-        print(f"\n{RED}❌ 错误: 未找到任何金牌用例。{RESET}")
+        print(f"\n{RED}[X] 错误: 未找到任何金牌用例。{RESET}")
         print(f"💡 提示: 请先运行「4. 轨迹聚类与分析」处理录制的轨迹。")
         time.sleep(2)
         return
@@ -319,7 +390,7 @@ def menu_smoke():
     print("  1. test_specs (YAML)")
     print("  2. artifacts/smoke_tests (YAML/JSON)")
     print("  3. artifacts/traces/raw (JSON)")
-    print("  4. ✋ 手工自由操作 (Manual Mode)")
+    print("  4. [M] 手工自由操作 (Manual Mode)")
     print("  0. 跳过")
     sub_choice = input(f"{BOLD}请选择 (0-4): {RESET}").strip()
     
@@ -348,8 +419,14 @@ def menu_recovery():
     
     log_file = select_file("artifacts/logs", [".log"], "选择要恢复的日志")
     if not log_file: return
+
+    print(f"\n{YELLOW}是否同时生成 AI 总结报告?{RESET}")
+    is_report = input(f"{BOLD}生成请按 y，点击回车默认生成 (Y/n): {RESET}").strip().lower() != 'n'
     
     cmd = ["python", "tracer/trace_recovery.py", log_file]
+    if is_report:
+        cmd.append("--report")
+    
     run_command(cmd)
 
 def main():
@@ -357,10 +434,14 @@ def main():
     parser.add_argument("--debug", action="store_true", help="显示调试信息 (DEBUG:)")
     args, unknown = parser.parse_known_args()
 
-    # 设置全局调试环境变量
+    # 设置全局调试环境变量 (优先尊重 .env，命令行 --debug 可临时覆盖)
+    env_debug = os.getenv("TEST_DEBUG", "0")
     if args.debug:
         os.environ["TEST_DEBUG"] = "1"
-        print(f"{BLUE}[INFO] 调试模式已开启 (DEBUG 日志将显示){RESET}")
+        print(f"{BLUE}[INFO] 调试模式已开启 (命令行手动触发){RESET}")
+    elif env_debug == "1":
+        os.environ["TEST_DEBUG"] = "1"
+        print(f"{BLUE}[INFO] 调试模式已开启 (来自 .env 配置){RESET}")
     else:
         os.environ["TEST_DEBUG"] = "0"
 
@@ -379,17 +460,22 @@ def main():
         print(f"  {RED}0.{RESET} 退出 (Exit)")
         print()
         
-        choice = input(f"{BOLD}输入编号 (0-8): {RESET}").strip()
-        if choice == '1': menu_exploratory()
-        elif choice == '2': menu_scripted()
-        elif choice == '3': menu_replay()
-        elif choice == '4': menu_analyser()
-        elif choice == '5': menu_cleanup()
-        elif choice == '6': menu_batch()
-        elif choice == '7': menu_smoke()
-        elif choice == '8': menu_recovery()
-        elif choice == '0': break
-        else: time.sleep(1)
+        try:
+            choice = input(f"{BOLD}输入编号 (0-8): {RESET}").strip()
+            if choice == '1': menu_exploratory()
+            elif choice == '2': menu_scripted()
+            elif choice == '3': menu_replay()
+            elif choice == '4': menu_analyser()
+            elif choice == '5': menu_cleanup()
+            elif choice == '6': menu_batch()
+            elif choice == '7': menu_smoke()
+            elif choice == '8': menu_recovery()
+            elif choice == '0': break
+            else: time.sleep(1)
+        except KeyboardInterrupt:
+            print(f"\n\n{YELLOW}[提示] 您已在主菜单按下 Ctrl+C。再次输入以退出，或按回车键刷新界面。{RESET}")
+            time.sleep(1)
+            continue
 
 if __name__ == "__main__":
     main()

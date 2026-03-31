@@ -1,6 +1,12 @@
+import sys
+import io
+
+# 兼容 Windows 终端 Emoji 输出
+if sys.platform == "win32" and isinstance(sys.stdout, io.TextIOWrapper):
+    sys.stdout.reconfigure(encoding='utf-8')
+
 import asyncio
 import os
-import sys
 import argparse
 import glob
 

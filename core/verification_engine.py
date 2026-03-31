@@ -8,6 +8,7 @@ import uuid
 from datetime import datetime
 from typing import Dict, Any, Optional, Union, List
 from playwright.async_api import async_playwright
+from core.utils import is_port_alive, get_agent_browser_executable
 
 _pw_context_manager = None
 _pw_browser = None
@@ -41,10 +42,11 @@ async def _keepalive_loop():
             pass  # 保活失败静默处理，不影响主流程
 
 
-async def initialize_verification_engine():
+async def initialize_verification_engine(logger=None):
     """显式初始化 Playwright 和 浏览器连接"""
     global _pw_context_manager, _pw_browser, _pw_lock, _keepalive_task
 
+    if logger is None: logger = print
     async with _pw_lock:
         if _pw_context_manager and _pw_browser:
             # [v1.9 修复1] 心跳：改用本地状态检查，不做 CDP 往返，避免页面跳转期间误触发重连
@@ -59,44 +61,73 @@ async def initialize_verification_engine():
             profile_name = os.getenv("AGENT_BROWSER_PROFILE", "browser_profile")
             profile_path = os.path.join(os.getcwd(), 'artifacts', profile_name)
 
-            print(f"  [Init] 正在从 agent-browser 获取 CDP URL (Port: {port}, Profile: {profile_name})...", flush=True)
+            # [Heuristic 1] 优先探测服务是否已经运行，避免重复且耗时的 npx 调用
+            if is_port_alive(port):
+                logger(f"  [Init] 检测到端口 {port} 已有存活服务，正在尝试复用...")
+                cdp_url = f"http://127.0.0.1:{port}"
+            else:
+                logger(f"  [Init] 正在从 agent-browser 获取 CDP URL (Port: {port})...")
+                
+                env = os.environ.copy()
+                env['AGENT_BROWSER_PORT'] = port
+                
+                # [Fix] 清理代理环境变量
+                for p_var in ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'all_proxy', 'ALL_PROXY']:
+                    if p_var in env: del env[p_var]
 
-            env = os.environ.copy()
-            env['AGENT_BROWSER_PORT'] = port
+                # [Optimization] 获取最优执行路径 (优先本地 node_modules)
+                cmd_base = get_agent_browser_executable()
+                cmd = f'{cmd_base} --profile "{profile_path}" get cdp-url --json'
+                cdp_url = None
 
-            cmd_base = 'npx.cmd' if os.name == 'nt' else 'npx'
-            cmd = f'{cmd_base} agent-browser --profile "{profile_path}" get cdp-url --json'
-            cdp_url = None
-
-            try:
-                proc = subprocess.run(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    env=env,
-                    shell=True,
-                    text=True,
-                    encoding='utf-8',
-                    errors='ignore',
-                    timeout=15.0
-                )
-                stdout_str = proc.stdout.strip()
-                if proc.returncode == 0:
+                try:
+                    # [V3.1 深度异步化] 使用 create_subprocess_shell 替代同步 subprocess.run
+                    proc = await asyncio.create_subprocess_shell(
+                        cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        env=env
+                    )
+                    
                     try:
-                        data = json.loads(stdout_str)
-                        if data.get('success'):
-                            cdp_url = data['data']['cdpUrl']
-                            print(f"  [Init] 成功从 agent-browser 获取 CDP URL: {cdp_url}")
-                    except:
-                        pass
-            except:
-                pass
+                        # 使用 asyncio.wait_for 实现精准超时控制
+                        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+                        stdout_str = stdout.decode('utf-8', errors='ignore').strip()
+                        
+                        if proc.returncode == 0:
+                            try:
+                                # [V3.1.1 修复] 兼容多行输出情况，提取最后一行 JSON
+                                last_line = stdout_str.split('\n')[-1].strip()
+                                data = json.loads(last_line)
+                                if data.get('success'):
+                                    cdp_url = data['data']['cdpUrl']
+                                    logger(f"  [Init] 成功从 agent-browser 获取 CDP URL: {cdp_url}")
+                            except:
+                                pass
+                    except asyncio.TimeoutError:
+                        logger(f"  [Warn] 获取 CDP URL 超时 (15s)")
+                        try: proc.kill()
+                        except: pass
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger(f"  [Error] 获取 CDP URL 过程中发生异常: {e}")
 
             if not cdp_url:
+                # [V3.1.1 强化] 动态获取失败，尝试强制拉起 agent-browser
+                logger(f"  [Init] 正在尝试强制拉起 agent-browser 进程...")
+                cmd_base = get_agent_browser_executable()
+                try:
+                    force_start_cmd = f'{cmd_base} --profile "{profile_path}" wait --timeout 1500'
+                    await asyncio.create_subprocess_shell(force_start_cmd, env=os.environ.copy())
+                    await asyncio.sleep(4.0) # 给 4s 环境稳定时间
+                except:
+                    pass
+                
                 cdp_url = f"http://127.0.0.1:{port}"
-                print(f"  [Warn] 无法动态获取 CDP URL，尝试直连: {cdp_url}")
+                logger(f"  [Warn] 无法动态获取 CDP URL，尝试直连模式: {cdp_url}")
         except Exception as e:
-            print(f"  [Error] 获取 CDP URL 异常: {e}")
+            logger(f"  [Error] 环境预检异常: {e}")
             return False
 
         try:
@@ -104,9 +135,24 @@ async def initialize_verification_engine():
                 _pw_context_manager = await async_playwright().start()
 
             if not _pw_browser:
-                _pw_browser = await _pw_context_manager.chromium.connect_over_cdp(cdp_url, timeout=15000)
-                
-                # 为所有已存在的页面挂载弹窗处理器
+                # [V3.4.2 终极加固] 建立连接 (增加双层超时与强制自愈)
+                max_cdp_retries = 3
+                for cdp_attempt in range(1, max_cdp_retries + 1):
+                    try:
+                        # 注入 15s 的任务级超时，防止 connect_over_cdp 无限挂起
+                        _pw_browser = await asyncio.wait_for(
+                            _pw_context_manager.chromium.connect_over_cdp(cdp_url, timeout=12000), 
+                            timeout=15.0
+                        )
+                        logger(f"  [Init] CDP 握手成功 (尝试: {cdp_attempt})")
+                        break
+                    except (asyncio.TimeoutError, Exception) as cdp_err:
+                        if cdp_attempt == max_cdp_retries:
+                            raise cdp_err
+                        logger(f"  [Warn] CDP 尝试 {cdp_attempt} 超时/失败，正在重置隧道...")
+                        await asyncio.sleep(2.0)
+
+                # 为所有已存在的页面挂载弹窗处理器 (此时 _pw_browser 已经成立)
                 for context in _pw_browser.contexts:
                     for page in context.pages:
                         _setup_dialog_handler(page)
@@ -117,14 +163,16 @@ async def initialize_verification_engine():
 
             return True
         except Exception as e:
-            print(f"DEBUG Error connecting to Playwright: {e}")
+            logger(f"  [Error] 连接 Playwright 失败: {e}")
+            # 处理失败时，重置浏览器对象，防止后续逻辑（如 Keepalive）误判
+            _pw_browser = None
             return False
 
 def _setup_dialog_handler(page):
     """为 Page 挂载自动处理原生弹窗的逻辑"""
     global _last_native_dialog
     try:
-        # 如果已经挂载过则不再重复挂载（简单去重）
+        # 如果已经挂载过则不再重复挂载
         if hasattr(page, "_has_dialog_handler"): return
         
         async def handle_dialog(dialog):
@@ -146,11 +194,12 @@ def get_last_dialog_message():
     return msg
 
 
-async def get_playwright_page(target_url: Optional[str] = None):
+async def get_playwright_page(target_url: Optional[str] = None, logger=None):
     """获取连接到 agent-browser 的 Playwright Page 对象，包含自动重连逻辑"""
     global _pw_browser, _pw_context_manager, _last_reconnect_time
+    if logger is None: logger = print
 
-    # [v1.9 修复1] 基础连接检查：改用本地 is_connected() 轻量检查
+    # [v1.9 修复1] 基础连接检查
     is_connected = False
     if _pw_browser:
         try:
@@ -160,14 +209,13 @@ async def get_playwright_page(target_url: Optional[str] = None):
 
     if not is_connected:
         now = time.monotonic()
-        # [v1.9 修复2] 重连冷却：距上次重连未满冷却期，等待而不是立刻重建
         if now - _last_reconnect_time < _RECONNECT_COOLDOWN_SECS:
             remaining = _RECONNECT_COOLDOWN_SECS - (now - _last_reconnect_time)
-            print(f"  [Warn] CDP 断线，冷却期内等待 {remaining:.1f}s...", flush=True)
+            logger(f"  [Warn] CDP 断线，冷却期内等待 {remaining:.1f}s...")
             await asyncio.sleep(min(remaining, 3.0))
         _last_reconnect_time = time.monotonic()
         await close_verification_engine()
-        success = await initialize_verification_engine()
+        success = await initialize_verification_engine(logger=logger)
         if not success:
             return None
 
@@ -216,29 +264,26 @@ async def get_playwright_page(target_url: Optional[str] = None):
                 _setup_dialog_handler(_pw_page)
 
                 try:
-                    # [v1.9 修复1] 心跳轻量化：优先用 is_connected() 本地检查
-                    # 只在无法确定时才用 title() 做 CDP 往返验证
                     if not _pw_browser.is_connected():
                         raise ConnectionError("Browser disconnected")
-                    # 仅做一次轻量的 URL 读取（本地属性，无 CDP 往返）
+                    # 仅做一次轻量的 URL 读取验证
                     _ = _pw_page.url
                     return _pw_page
                 except ConnectionError:
                     raise
                 except Exception as e:
-                    # page.url 失败才说明 page handle 真的无效
                     raise ConnectionError(f"Page handle invalid: {e}")
 
             await asyncio.sleep(0.5)
         except (Exception, ConnectionError) as e:
             err_msg = str(e).lower()
             if any(kw in err_msg for kw in ("connection closed", "disconnected", "handle invalid", "connection lost")):
-                print(f"  [Warn] CDP 通讯中断 ({e})，正在尝试强制恢复...", flush=True)
+                logger(f"  [Warn] CDP 通讯中断 ({e})，正在尝试强制恢复...")
                 now = time.monotonic()
                 if now - _last_reconnect_time >= _RECONNECT_COOLDOWN_SECS:
                     _last_reconnect_time = now
                     await close_verification_engine()
-                    success = await initialize_verification_engine()
+                    success = await initialize_verification_engine(logger=logger)
                     if not success:
                         break
             await asyncio.sleep(1.0)
@@ -293,7 +338,7 @@ async def _save_verification_debug(page, expected, actual_text, processed_full_t
         with open(os.path.join(tmp_dir, f"{prefix}.json"), "w", encoding="utf-8") as f:
             json.dump(debug_info, f, indent=2, ensure_ascii=False)
             
-        # 2. 保存完整文本内容 (TXT) - 优先保存用于匹配的真实大文本
+        # 2. 保存完整文本内容 (TXT)
         with open(os.path.join(tmp_dir, f"{prefix}.txt"), "w", encoding="utf-8") as f:
             f.write(processed_full_text if processed_full_text else actual_text)
             
@@ -305,7 +350,7 @@ async def _save_verification_debug(page, expected, actual_text, processed_full_t
         # 4. 保存截图 (PNG)
         await page.screenshot(path=os.path.join(tmp_dir, f"{prefix}.png"), full_page=True)
         
-        print(f"  [Debug] 断言现场已保存至: {prefix}.* (包含匹配用全文本 TXT)", flush=True)
+        print(f"  [Debug] 断言现场已保存至: {prefix}.*", flush=True)
     except Exception as e:
         print(f"  [Warn] 保存调试现场失败: {e}", flush=True)
 
@@ -368,23 +413,17 @@ async def verify(page, expected: Union[Dict[str, Any], List[Dict[str, Any]], Non
 
             elif exp_type == "text_present":
                 target = "".join(str(exp_value).split()).lower()
-                # 增强版文本提取范围：innerText + placeholder + input/textarea value + title 属性
                 full_text = await page.evaluate("""() => {
                     let text = document.body ? document.body.innerText : '';
-                    
-                    // 补充 input/textarea 的占位符和当前值
                     const inputs = Array.from(document.querySelectorAll('input, textarea'));
                     inputs.forEach(el => {
                         if (el.placeholder) text += ' ' + el.placeholder;
                         if (el.value) text += ' ' + el.value;
                     });
-                    
-                    // 补充 title 属性（常用于悬浮提示，也是可见文本源）
                     const titles = Array.from(document.querySelectorAll('[title]'));
                     titles.forEach(el => {
                         if (el.title) text += ' ' + el.title;
                     });
-                    
                     return text;
                 }""")
                 last_full_text = full_text
@@ -403,14 +442,12 @@ async def verify(page, expected: Union[Dict[str, Any], List[Dict[str, Any]], Non
         except Exception as e:
             last_actual = f"评估报错: {e}"
             if "connection closed" in str(e).lower():
-                raise  # 抛给外层触发重连
+                raise
 
         await asyncio.sleep(interval)
         elapsed += interval
 
-    # 最终失败前保存调试信息
     if expected:
-        # 如果提供了 snapshot_id 则优先使用，否则尝试从 after_snapshot 提取
         sid = snapshot_id or (after_snapshot.get('snapshot_id') if after_snapshot else None)
         await _save_verification_debug(page, expected, last_actual, last_full_text, sid)
 
