@@ -60,7 +60,7 @@ async def main():
                     snapshot = await get_snapshot()
                     messages = init_step_messages("🛑 [CI 全局手工前置] 请完成必要操作后回复 completed。")
                     append_snapshot(messages, snapshot)
-                    decision = decide_action(messages)
+                    decision = await decide_action(messages)
                     if decision.get('task_status') == 'completed': break
                     await execute(decision)
             elif args.pre_steps.lower().endswith('.json'):

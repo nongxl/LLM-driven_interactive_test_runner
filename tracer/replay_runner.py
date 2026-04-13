@@ -67,7 +67,24 @@ from core.report_generator import ReportGenerator
 _log_func = print
 
 def log_it(msg, end="\n", flush=True):
-    _log_func(msg, end=end, flush=flush)
+    import inspect
+    # 获取 _log_func 的参数信息
+    try:
+        sig = inspect.signature(_log_func)
+        params = list(sig.parameters.values())
+        
+        # 如果是 print 或者明确支持 end/flush 的函数
+        if _log_func == print or (len(params) > 1 and any(p.name in ('end', 'flush') for p in params)):
+            _log_func(msg, end=end, flush=flush)
+        else:
+            # 仅传递单个参数，并在必要时由外部处理换行
+            _log_func(msg if end == "" else f"{msg}{end}")
+    except:
+        # 降级方案
+        try:
+            _log_func(msg, end=end, flush=flush)
+        except:
+            _log_func(msg)
 
 
 async def find_element_by_semantic_locator(locator: Any) -> Optional[str]:

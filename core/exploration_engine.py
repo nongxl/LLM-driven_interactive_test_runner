@@ -15,7 +15,8 @@ class ExplorationEngine:
         actions = []
         
         # 正则匹配适配 agent-browser 格式: - role "Name" [ref=eID] (可能伴随 focusable, clickable 等)
-        pattern = r'- (button|link|textbox|checkbox|combobox|menuitem|tab|generic)\s+"([^"]*)"\s+\[ref=(e\d+)[^\]]*\]'
+        # 增加对携带 clickable=True 的标识捕获能力，即使角色是 generic
+        pattern = r'- (button|link|textbox|checkbox|combobox|menuitem|tab|generic)\s+"([^"]*)"\s+\[ref=(e\d+)(?:,[^\]]*clickable=True|[^\]]*)\]'
         matches = re.finditer(pattern, aria_text)
         
         for match in matches:
@@ -63,13 +64,13 @@ class ExplorationEngine:
         messages = [{"role": "user", "content": prompt}]
         try:
             # [V2] 使用静默模式，防止 API 缺失时阻塞
-            assessment = decide_action(messages, allow_interactive=False)
+            assessment = await decide_action(messages, allow_interactive=False)
             return assessment
 
         except Exception as e:
             return {"status": "unknown", "reason": f"AI 评估异常: {str(e)}", "score": 0.5}
 
-    def decide_next_step(self, snapshot: Dict[str, Any], state_memory, interactive: bool = False) -> Optional[Dict[str, Any]]:
+    async def decide_next_step(self, snapshot: Dict[str, Any], state_memory, interactive: bool = False) -> Optional[Dict[str, Any]]:
         """
         决定下一步动作。
         如果 interactive=True，则进入交互模式，等待用户手动输入 JSON 指令。
@@ -85,22 +86,26 @@ class ExplorationEngine:
         
         if interactive:
             from ai.llm_client import decide_action
-            from ai.prompt_builder import init_step_messages, append_snapshot
+            from ai.prompt_builder import init_step_messages, append_snapshot, append_history
             
             # 构造交互提示
             instruction = "🛑 [探索交互模式] 请根据当前页面状态，手动输入下一步操作的 JSON 指令。"
             messages = init_step_messages(instruction)
             append_snapshot(messages, snapshot)
+            append_history(messages, state_memory) # [V4.0] 注入历史记忆
             
             # 调用交互式决策（会触发终端输入）
-            selected_action = decide_action(messages, allow_interactive=True)
+            selected_action = await decide_action(messages, allow_interactive=True)
             
         else:
             # 调用策略自动选择动作
             selected_action = self.strategy_manager.get_action(state_id, all_actions, state_memory)
         
         if selected_action:
-            # 标记该动作已在该状态下执行
-            state_memory.mark_action(state_id, selected_action)
+            # 标记该动作已在该状态下执行 (如果是列表，取第一个作为代表)
+            main_action = selected_action[0] if isinstance(selected_action, list) and selected_action else selected_action
+            if isinstance(main_action, dict):
+                state_memory.mark_action(state_id, main_action)
+                state_memory.record_step(main_action, snapshot) # [V4.0] 语义记忆持久化
             
         return selected_action

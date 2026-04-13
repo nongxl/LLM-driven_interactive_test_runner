@@ -65,7 +65,28 @@ def append_snapshot(messages, snapshot):
         )
 
     if aria_text:
-        content += f"▶ 最新页面结构视口 (ARIA Tree):\n{aria_text}"
+        content += f"▶ 最新页面结构视口 (ARIA Tree):\n[Snapshot ARIA]\n{aria_text}\n[/Snapshot ARIA]"
     else:
         content += "▶ 最新页面结构: [空/加载中]"
     messages.append({"role": "user", "content": content})
+
+def append_history(messages, memory):
+    """将最近的历史记录与路径导航信息注入会话上下文"""
+    history_text = memory.get_history_summary(max_detailed=10)
+    
+    # 提取面包屑或顶级路径
+    nav_summary = " > ".join(memory.nav_path[-5:]) if memory.nav_path else "未知"
+    
+    content = (
+        "▶ 场景上下文 (State Memory):\n"
+        f"【当前路径】: {nav_summary}\n"
+        f"【历史轨迹】 (仅展示最近 10 步详情及远期摘要):\n"
+        f"--------------------------------------------------\n"
+        f"{history_text}\n"
+        "--------------------------------------------------\n"
+        "💡 注意：参考历史轨迹可避免重复点击无效按钮或在死循环中打转。"
+    )
+    # 将记忆插入到系统指令之后，当前快照之前
+    # 通常 messages[0] 是 system, messages[1] 是 user target
+    # 插入在 index 2
+    messages.insert(2, {"role": "user", "content": content})

@@ -66,17 +66,16 @@ def cleanup_browser_env(port=None, profile_name="browser_profile", logger=None, 
             for name in pure_automation_names:
                 subprocess.run(['taskkill', '/F', '/IM', name, '/T'], capture_output=True, timeout=5)
             
-            # B. 精准停止：仅对带自动化 Profile 的浏览器使用 PowerShell 过滤 (增加 15s 强制超时)
-            # 这里的 profile_name 默认为 browser_profile
+            # B. 精准停止：针对浏览器进程 (chrome/edge) 及 agent-browser 守护进程 (node) 使用 PowerShell 过滤
             search_pattern = profile_name if profile_name else "browser_profile"
-            ps_kill_browsers = f'Get-CimInstance Win32_Process -Filter "Name = \'chrome.exe\' OR Name = \'msedge.exe\'" | Where-Object {{ $_.CommandLine -like "*{search_pattern}*" }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}'
+            ps_kill_processes = f'Get-CimInstance Win32_Process -Filter "Name = \'chrome.exe\' OR Name = \'msedge.exe\' OR Name = \'node.exe\'" | Where-Object {{ $_.CommandLine -like "*{search_pattern}*" -or $_.CommandLine -like "*agent-browser*" }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}'
             
             # C. 端口清理 (增加 15s 强制超时)
             ps_kill_ports = ""
             for p in list(set(target_ports)):
                 ps_kill_ports += f'Get-NetTCPConnection -LocalPort {p} -ErrorAction SilentlyContinue | ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }} ; '
             
-            full_ps = f'{ps_kill_browsers} ; {ps_kill_ports}'
+            full_ps = f'{ps_kill_processes} ; {ps_kill_ports}'
             try:
                 subprocess.run(['powershell', '-Command', full_ps], capture_output=True, timeout=15)
                 logger(f" [OK] 已完成进程清理与端口回收")

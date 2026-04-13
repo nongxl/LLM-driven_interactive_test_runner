@@ -82,14 +82,18 @@ async def _run(cmd_args):
                 return all_output
 
             except asyncio.TimeoutError:
-                try: proc.kill()
+                try:
+                    proc.kill()
+                    await proc.wait()
                 except: pass
                 return f"{S_ERR} Error: 指令执行超时 (45s)"
 
         except asyncio.CancelledError:
             # 高效捕获用户中断 (Ctrl+C)
             if 'proc' in locals():
-                try: proc.kill()
+                try:
+                    proc.kill()
+                    await proc.wait()
                 except: pass
             raise
         except Exception as e:
@@ -117,13 +121,36 @@ async def execute(action):
         return f"{S_ERR} Error: Action must be a dict or list of dicts, got {type(action).__name__}"
 
     action_type = action.get('action', '').lower()
-    target = action.get('target', '')
+    target = action.get('target') or action.get('ref', '')
     value = action.get('value', '')
     task_status = action.get('task_status', '')
 
     try:
+        # [v3.6 优化] 活跃页签自动对齐：确保动作执行在用户当前可见/聚焦的 Tab 上
+        from core.verification_engine import get_last_active_url
+        active_url = get_last_active_url()
+        
+        # 仅针对需要页面上下文的动作进行同步
+        if active_url and action_type in ('click', 'type', 'fill', 'scroll', 'scrollintoview', 'keyboard', 'get_text', 'hover'):
+            # 1. 获取当前 CLI 所处的活跃页签
+            tab_list_json = await _run(['tab', 'list', '--json'])
+            try:
+                tab_data = json.loads(tab_list_json)
+                if tab_data.get('success'):
+                    tabs = tab_data['data']['tabs']
+                    current_active_tab = next((t for t in tabs if t.get('active')), None)
+                    
+                    # 2. 如果当前活跃页签 URL 与快照检测到的不一致，则尝试切换
+                    if not current_active_tab or current_active_tab.get('url') != active_url:
+                        target_tab = next((t for t in tabs if t.get('url') == active_url), None)
+                        if target_tab:
+                            target_idx = target_tab['index']
+                            print(f"  [Sync] 检测到活跃页签变动，正在同步 CLI 状态至 Tab {target_idx} (URL: {active_url})")
+                            await _run(['tab', str(target_idx)])
+            except Exception as e:
+                print(f"  [Warn] 页签对齐失败: {e}")
+
         # [v1.9.5 优化] 处理纯状态更新指令 (No-Op Action)
-        # 支持用户输入 {"task_status": "completed"} 来手动结束步骤
         if not action_type and task_status:
             return f"{S_OK} 状态同步成功: {task_status}"
 

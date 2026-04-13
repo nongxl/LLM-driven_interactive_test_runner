@@ -21,7 +21,16 @@ _RECONNECT_COOLDOWN_SECS: float = 15.0
 
 # [v1.9.2 优化] 缓存原生弹窗内容，供快照系统读取
 _last_native_dialog: Optional[str] = None
+# [v3.6 优化] 缓存最后一次检测到的活跃业务页签 URL
+_last_active_url: Optional[str] = None
 
+def is_engine_connected():
+    """轻量级健康检查，供交互模式快速判断"""
+    global _pw_browser
+    try:
+        return _pw_browser is not None and _pw_browser.is_connected()
+    except:
+        return False
 
 async def _keepalive_loop():
     """[v1.9 修复4] 后台保活 Task：每 20s 轻量检查 CDP 连接，主动触发重连而非等到失败。"""
@@ -77,21 +86,30 @@ async def initialize_verification_engine(logger=None):
 
                 # [Optimization] 获取最优执行路径 (优先本地 node_modules)
                 cmd_base = get_agent_browser_executable()
-                cmd = f'{cmd_base} --profile "{profile_path}" get cdp-url --json'
+                cmd = [cmd_base, "--profile", profile_path, "get", "cdp-url", "--json"]
                 cdp_url = None
 
                 try:
-                    # [V3.1 深度异步化] 使用 create_subprocess_shell 替代同步 subprocess.run
-                    proc = await asyncio.create_subprocess_shell(
-                        cmd,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                        env=env
-                    )
+                    # [V4.1] 使用 create_subprocess_shell 并拼接命令字符串以支持 Windows shell 环境
+                    if os.name == 'nt':
+                        cmd_str = f'{" ".join(cmd)}'
+                        proc = await asyncio.create_subprocess_shell(
+                            cmd_str,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            env=env
+                        )
+                    else:
+                        proc = await asyncio.create_subprocess_exec(
+                            *cmd,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            env=env
+                        )
                     
                     try:
-                        # 使用 asyncio.wait_for 实现精准超时控制
-                        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+                        # [Optimization] 缩短探测超时至 5.0，及时发现卡顿
+                        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
                         stdout_str = stdout.decode('utf-8', errors='ignore').strip()
                         
                         if proc.returncode == 0:
@@ -105,8 +123,10 @@ async def initialize_verification_engine(logger=None):
                             except:
                                 pass
                     except asyncio.TimeoutError:
-                        logger(f"  [Warn] 获取 CDP URL 超时 (15s)")
-                        try: proc.kill()
+                        logger(f"  [Warn] 获取 CDP URL 超时 (5s)，怀疑守护进程挂起")
+                        try:
+                            proc.kill()
+                            await proc.wait()
                         except: pass
                 except asyncio.CancelledError:
                     raise
@@ -114,18 +134,24 @@ async def initialize_verification_engine(logger=None):
                     logger(f"  [Error] 获取 CDP URL 过程中发生异常: {e}")
 
             if not cdp_url:
-                # [V3.1.1 强化] 动态获取失败，尝试强制拉起 agent-browser
-                logger(f"  [Init] 正在尝试强制拉起 agent-browser 进程...")
+                # [V4.0 核心自愈] 动态获取失败，说明 3030 虽然占位但服务已死，必须强制重启
+                logger(f"  [Init] 正在执行【强制自愈模式】：重启 agent-browser 守护进程...")
                 cmd_base = get_agent_browser_executable()
                 try:
+                    # 先杀掉可能活着的僵尸进程
+                    close_cmd = f'{cmd_base} --profile "{profile_path}" close'
+                    cp_close = await asyncio.create_subprocess_shell(close_cmd, env=os.environ.copy())
+                    await asyncio.wait_for(cp_close.wait(), timeout=5.0)
+                    
+                    # 重新拉起并等待
                     force_start_cmd = f'{cmd_base} --profile "{profile_path}" wait --timeout 1500'
                     await asyncio.create_subprocess_shell(force_start_cmd, env=os.environ.copy())
-                    await asyncio.sleep(4.0) # 给 4s 环境稳定时间
+                    await asyncio.sleep(3.0) 
                 except:
                     pass
                 
                 cdp_url = f"http://127.0.0.1:{port}"
-                logger(f"  [Warn] 无法动态获取 CDP URL，尝试直连模式: {cdp_url}")
+                logger(f"  [Warn] 守护进程已尝试重启，直连模式: {cdp_url}")
         except Exception as e:
             logger(f"  [Error] 环境预检异常: {e}")
             return False
@@ -136,21 +162,21 @@ async def initialize_verification_engine(logger=None):
 
             if not _pw_browser:
                 # [V3.4.2 终极加固] 建立连接 (增加双层超时与强制自愈)
-                max_cdp_retries = 3
+                max_cdp_retries = 2
                 for cdp_attempt in range(1, max_cdp_retries + 1):
                     try:
-                        # 注入 15s 的任务级超时，防止 connect_over_cdp 无限挂起
+                        # [Optimization] 将 CDP 握手超时缩短至 4s，减少用户等待感
                         _pw_browser = await asyncio.wait_for(
-                            _pw_context_manager.chromium.connect_over_cdp(cdp_url, timeout=12000), 
-                            timeout=15.0
+                            _pw_context_manager.chromium.connect_over_cdp(cdp_url, timeout=4000), 
+                            timeout=5.0
                         )
                         logger(f"  [Init] CDP 握手成功 (尝试: {cdp_attempt})")
                         break
                     except (asyncio.TimeoutError, Exception) as cdp_err:
                         if cdp_attempt == max_cdp_retries:
                             raise cdp_err
-                        logger(f"  [Warn] CDP 尝试 {cdp_attempt} 超时/失败，正在重置隧道...")
-                        await asyncio.sleep(2.0)
+                        logger(f"  [Warn] CDP 握手失败/超时 (4s)，准备重试...")
+                        await asyncio.sleep(0.5)
 
                 # 为所有已存在的页面挂载弹窗处理器 (此时 _pw_browser 已经成立)
                 for context in _pw_browser.contexts:
@@ -220,7 +246,8 @@ async def get_playwright_page(target_url: Optional[str] = None, logger=None):
             return None
 
     # 页面抓取与属性验证循环
-    for attempt in range(5):
+    # [V4.1] 减少重试次数，平衡响应速度与稳定性
+    for attempt in range(3):
         try:
             if not _pw_browser or not _pw_browser.is_connected():
                 raise ConnectionError("CDP Connection lost")
@@ -233,15 +260,44 @@ async def get_playwright_page(target_url: Optional[str] = None, logger=None):
             for p in all_pages:
                 try:
                     url = p.url
+                    # [V4.1] 允许捕获空白页，以便支持框架的初始导航 (goto) 逻辑
                     if url and not url.startswith("chrome://"):
                         business_pages.append(p)
                 except:
                     continue
 
+            if not business_pages:
+                logger(f"  [Warn] (Attempt {attempt+1}/3) 未检测到任何活跃的业务页签，请确保浏览器已打开目标系统页面...")
+                await asyncio.sleep(1.5)
+                continue
+
             if business_pages:
                 _pw_page = None
 
-                if target_url:
+                # [v3.6 优化] 智能活跃页签检测：优先抓取当前处于 Visible/Focus 状态的页面
+                if not target_url and len(business_pages) > 1:
+                    try:
+                        # [V4.1] 为探测逻辑增加 3s 硬超时，防止因某个页签正在关闭导致的整体挂起
+                        results = await asyncio.wait_for(
+                            asyncio.gather(*[
+                                p.evaluate("({visible: document.visibilityState === 'visible', focus: document.hasFocus()})")
+                                for p in business_pages
+                            ], return_exceptions=True),
+                            timeout=3.0
+                        )
+                        
+                        for idx, res in enumerate(results):
+                            if isinstance(res, dict) and res.get('visible'):
+                                _pw_page = business_pages[idx]
+                                if res.get('focus'): # 拥有焦点的是绝对首选
+                                    break
+                        if _pw_page:
+                            _last_active_url = _pw_page.url
+                            logger(f"  [ActiveTab] 自动追踪到活跃页签: {_pw_page.url}")
+                    except (asyncio.TimeoutError, Exception) as e:
+                        logger(f"  [Warn] 活跃页签探测超时/异常: {e}")
+
+                if not _pw_page and target_url:
                     for p in business_pages:
                         if p.url == target_url:
                             _pw_page = p
@@ -307,7 +363,8 @@ async def close_verification_engine():
     async with _pw_lock:
         if _pw_browser:
             try:
-                await _pw_browser.close()
+                # [V5.0] 为关闭操作增加硬超时，防止卡在僵尸连接上
+                await asyncio.wait_for(_pw_browser.close(), timeout=3.0)
             except:
                 pass
             _pw_browser = None
@@ -453,6 +510,10 @@ async def verify(page, expected: Union[Dict[str, Any], List[Dict[str, Any]], Non
 
     return _result("rule", "dom", "fail", 1.0, last_actual, {})
 
+
+def get_last_active_url():
+    """获取最后一次快照探测到的活跃页签 URL"""
+    return _last_active_url
 
 def _result(method, source, result, confidence, reason, evidence):
     return {

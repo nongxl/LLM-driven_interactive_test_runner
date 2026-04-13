@@ -162,7 +162,7 @@ async def run_test(test_file, pre_steps_override=None):
         
         if isinstance(pre_steps, str):
             if pre_steps == "__MANUAL__":
-                log_it(f"{S_INFO} 已开启【手工自由操作】模式。请在浏览器中完成操作后，在控制台输入 completed 结束前置步骤。")
+                log_it(f"{S_INFO} 已开启【手工自由操作】模式。请在浏览器中完成操作后，在控制台输入: {os.environ.get('YELLOW', '')}{{\"task_status\": \"completed\"}}{os.environ.get('RESET', '')} 结束前置步骤。")
                 final_steps = [{
                     "instruction": "🛑 [手工前置模式] 请先在浏览器中完成任何必要的手工预处理内容操作（如滑条、验证码、复杂登录等）。完成后请在下方输入: {\"task_status\": \"completed\"}",
                     "expected": None
@@ -320,7 +320,7 @@ async def run_test(test_file, pre_steps_override=None):
 
                     # 2. 调用决策
                     append_snapshot(messages, snapshot)
-                    decision = decide_action(messages)
+                    decision = await decide_action(messages)
                     if decision:
                         # [NEW] 鲁棒性提取：处理 list 或 dict 返回
                         is_list = isinstance(decision, list)

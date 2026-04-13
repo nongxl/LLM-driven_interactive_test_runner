@@ -77,18 +77,34 @@ async def run_pre_steps(pre_steps: str, recorder: TraceRecorder, log_it):
         
         while True:
             snapshot = await get_snapshot(logger=log_it)
+            
+            # [V3.3.2 优化] 如果快照超时或失败，不再死循环等待，而是允许用户通过控制台强制完成
+            if snapshot.get('snapshot_id') == 'error' or snapshot.get('aria_text') == 'Timeout':
+                log_it("⚠️ [提示] 快照获取暂不可用（可能页面未加载或无活跃页签）。")
+                log_it("   [提示] 如果您操作已完成，仍可输入 {\"task_status\": \"completed\"} 强制继续。")
+                # 构造一个基础快照对象，确保下一步逻辑不崩溃
+                if not snapshot.get('aria_text'):
+                    snapshot['aria_text'] = "(快照暂不可用，等待手动指令)"
+
             messages = init_step_messages("🛑 [手工前置模式] 请先在浏览器中手动完成操作（如登录、验证码等），完成后回复: {\"task_status\": \"completed\"}")
             append_snapshot(messages, snapshot)
             
-            decision = decide_action(messages)
-            if decision.get('action') == 'force_exit':
+            # [Fix] 强制要求人工核准，防止 AI 在 auto 模式下提前接管
+            decision = await decide_action(messages, force_interactive=True)
+            
+            # [Fix] 这里的 decision 可能由 llm_client 返回为 list
+            main_decision = decision[0] if isinstance(decision, list) and decision else decision
+            
+            if isinstance(main_decision, dict) and main_decision.get('action') == 'force_exit':
                 return
             
-            if decision.get('task_status') == 'completed':
+            # 检查是否有完成标记
+            final_decision = decision[-1] if isinstance(decision, list) and decision else decision
+            if isinstance(final_decision, dict) and final_decision.get('task_status') in ('completed', 'complete'):
                 log_it("✅ 手工前置步骤已确认完成。")
                 break
             
-            # 执行手动输入的动作（如果有）
+            # [V3.3] 执行手动输入的动作（支持列表）
             await execute(decision)
 
     elif pre_steps.lower().endswith('.json'):
@@ -128,7 +144,7 @@ async def run_pre_steps(pre_steps: str, recorder: TraceRecorder, log_it):
                 # 2. 调用决策
                 messages = init_step_messages(instruction)
                 append_snapshot(messages, snapshot)
-                decision = decide_action(messages)
+                decision = await decide_action(messages)
                 
                 # [NEW] 鲁棒性提取：支持 dict 和 list 两种返回格式
                 is_list = isinstance(decision, list)
@@ -164,7 +180,7 @@ async def run_pre_steps(pre_steps: str, recorder: TraceRecorder, log_it):
         log_it(f"⚠️ 无法识别前置步骤配置: {pre_steps}")
 
 
-async def run_exploration(url, max_steps=30, pre_steps=None, interactive=False):
+async def run_exploratory_test(url, max_steps=30, pre_steps=None, interactive=False):
     """
     运行探索性测试过程。
     """
@@ -184,27 +200,25 @@ async def run_exploration(url, max_steps=30, pre_steps=None, interactive=False):
 
     def log_it(msg):
         msg_str = str(msg).strip()
-        # [Optimization] 增加更鲁棒的全局 DEBUG 过滤开关
         msg_upper = msg_str.upper()
+        
+        # [V4.2 严格过滤] 识别调试消息
         is_debug = "DEBUG:" in msg_upper or msg_upper.startswith("WAIT ") or msg_upper.startswith("BATCH ")
         show_debug = os.environ.get("TEST_DEBUG") == "1"
         
-        # 1. 控制台输出逻辑
-        if not is_debug or show_debug:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg_str}", flush=True)
+        # 如果是调试消息且未开启 DEBUG 模式，则彻底静默
+        if is_debug and not show_debug:
+            return
+
+        # 1. 控制台输出
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg_str}", flush=True)
             
-        try:
-            # 2. 文件保存逻辑
-            clean_msg = strip_ansi(msg_str)
-            with open(log_file_path, 'a', encoding='utf-8') as f:
-                f.write(clean_msg + "\n")
-                f.flush()
-        except Exception:
-            pass
+        # 2. 文件保存 (仅保存一次)
         try:
             clean_msg = strip_ansi(msg_str)
             with open(log_file_path, 'a', encoding='utf-8') as f:
                 f.write(f"[{datetime.now().strftime('%H:%M:%S')}] {clean_msg}\n")
+                f.flush()
         except: pass
 
     from core.verification_engine import initialize_verification_engine
@@ -230,58 +244,104 @@ async def run_exploration(url, max_steps=30, pre_steps=None, interactive=False):
         for step_idx in range(1, max_steps + 1):
             log_it(f"\n--- 步骤 {step_idx} ---")
             
-            # 3. 获取快照与 AI 状态自评估
-            snapshot = await get_snapshot(logger=log_it)
-            if not snapshot or snapshot.get('aria_text') == 'Timeout':
-                log_it("⚠️ 无法获取快照，跳过此步")
-                continue
-
-            # [V2] AI 智能健康检查
-            log_it("🧠 AI 正在评估页面状态...")
-            health = await engine.assess_page_health(snapshot)
-            h_status = health.get('status', 'unknown')
-            log_it(f"📊 状态评估: {h_status} ({health.get('reason', '')})")
+            decision = None
+            health = {"status": "unknown"}
             
-            # [Fix] 如果健康检查过程中触发了人工退出（如 AI 报错转人工后输入 exit）
-            if health.get('action') == 'force_exit':
-                log_it("🛑 人工指令：停止探索（在状态评估阶段）。")
+            # [V4.3] 引入步骤级重试机制 (处理加载延迟或 AI 瞬时失效)
+            for attempt in range(1, 4):
+                # 3. 获取快照与 AI 状态自评估
+                snapshot_dict = await get_snapshot(logger=log_it)
+                snapshot_text = snapshot_dict.get('aria_text', '')
+                
+                if not snapshot_text or snapshot_text in ('Timeout', '(快照暂不可用，等待手动指令)'):
+                    wait_time = attempt * 2.0
+                    log_it(f"⚠️ [Retry {attempt}] 无法获取快照，等待 {wait_time}s 后重试...")
+                    await asyncio.sleep(wait_time)
+                    continue
+
+                # [V2] AI 智能健康检查
+                log_it("🧠 AI 正在评估页面状态...")
+                health = await engine.assess_page_health(snapshot_dict)
+                h_status = health.get('status', 'unknown')
+                log_it(f"📊 状态评估: {h_status} ({health.get('reason', '')})")
+                
+                # 如果健康检查过程中触发了人工退出
+                if health.get('action') == 'force_exit':
+                    break
+                    
+                # [V3.5] 闭环自愈逻辑
+                if h_status == 'error' or "chrome-error://" in snapshot_dict.get('url', ''):
+                    page = await get_playwright_page()
+                    if page:
+                        cur_url = page.url
+                        log_it(f"🛠️  检测到系统级错误或异常页 (URL: {cur_url})，启动自愈程序...")
+                        
+                        success_recovery = False
+                        # [Recovery 1] 尝试重载
+                        log_it("  [Recovery Step 1] 尝试刷新当前页面 (Reload)...")
+                        try:
+                            await page.reload(timeout=5000)
+                            await asyncio.sleep(2.0)
+                            # 立即校验重载后的状态
+                            check_snap = await get_snapshot(logger=log_it)
+                            check_health = await engine.assess_page_health(check_snap)
+                            if check_health.get('status') != 'error':
+                                log_it("    ✅ Reload 恢复成功")
+                                success_recovery = True
+                        except: pass
+                        
+                        if not success_recovery:
+                            # [Recovery 2] 尝试后退 (排除空白页)
+                            if cur_url != "about:blank" and cur_url != url:
+                                log_it("  [Recovery Step 2] 尝试返回上一页 (Go Back)...")
+                                try:
+                                    await page.go_back(timeout=5000)
+                                    await asyncio.sleep(2.0)
+                                    # 立即校验回退后的状态
+                                    check_snap = await get_snapshot(logger=log_it)
+                                    check_health = await engine.assess_page_health(check_snap)
+                                    if check_health.get('status') != 'error':
+                                        log_it("    ✅ Go Back 恢复成功")
+                                        success_recovery = True
+                                except: pass
+                        
+                        if not success_recovery:
+                            # [Recovery 3] 终极方案：强制重定向回起始页
+                            log_it(f"  [Recovery Step 3] 终极方案：强制重定向至起始页: {url}")
+                            await execute({"action": "goto", "target": url})
+                            await asyncio.sleep(3.0)
+                        
+                        continue
+
+                # 4. 探索引擎决策
+                decision = await engine.decide_next_step(snapshot_dict, memory, interactive=interactive)
+                if decision:
+                    break
+                
+                if attempt < 3:
+                    wait_time = attempt * 3.0
+                    log_it(f"⚠️ [Retry {attempt}] 当前页面未发现可交互元素或评估不确定，等待 {wait_time}s 进行深度重试...")
+                    await asyncio.sleep(wait_time)
+            
+            # 如果重试后依然没有决策，则正式停止
+            if not decision:
+                if health.get('action') == 'force_exit':
+                    log_it("🛑 人工指令：停止探索。")
+                else:
+                    log_it("🏁 经过多次尝试，依然没有发现更多可消费的交互元素，停止探索。")
                 break
                 
-            # [V3.3] 错误自愈逻辑：如果发现是错误页，尝试逃逸
-            if h_status == 'error' or "chrome-error://" in snapshot.get('url', ''):
-                page = await get_playwright_page()
-                if page:
-                    log_it("🛠️  检测到系统级错误或浏览器异常页，启动自愈程序...")
-                    # 尝试 1: 返回上一页
-                    log_it("  [Recovery] 尝试返回上一页 (Go Back)...")
-                    try:
-                        await page.go_back(timeout=5000)
-                        await asyncio.sleep(2)
-                        continue # 跳过本步决策，重新获取快照评估
-                    except Exception as ge:
-                        log_it(f"  [Recovery] 返回失败: {ge}")
-                    
-                    # 尝试 2: 如果返回无效，强制重置到起始 URL
-                    log_it(f"  [Recovery] 强制重定向至起始页: {url}")
-                    await execute({"action": "goto", "target": url})
-                    await asyncio.sleep(3)
-                    continue 
-
-            # 4. 探索引擎决策
-            decision = engine.decide_next_step(snapshot, memory, interactive=interactive)
-            if not decision:
-                log_it("🏁 没有发现更多可消费的交互元素，停止探索。")
-                break
+            # [Fix] 这里的 decision 可能由 llm_client 返回为 list
+            main_decision = decision[0] if isinstance(decision, list) and decision else decision
             
-            # [Feature] 处理手动模式下的强制退出
-            if decision.get('action') == 'force_exit':
+            if isinstance(main_decision, dict) and main_decision.get('action') == 'force_exit':
                 log_it("🛑 各级人工指令：停止探索。")
                 break
                 
-            log_it(f"决定执行: {decision['action']} [{decision.get('ref')}] {decision.get('role')} \"{decision.get('name')}\"")
+            log_it(f"决定执行: {main_decision.get('action')} [{main_decision.get('ref')}] {main_decision.get('role')} \"{main_decision.get('name')}\"")
 
             # 5. 执行并记录
-            instruction = f"探索: {decision.get('role')} {decision.get('name')}"
+            instruction = f"探索: {main_decision.get('role')} {main_decision.get('name')}"
             recorder.begin_step(instruction=instruction)
             
             start_time = recorder.start_action()
@@ -298,15 +358,15 @@ async def run_exploration(url, max_steps=30, pre_steps=None, interactive=False):
                 except: pass
                 
                 snapshot_after = await get_snapshot(logger=log_it)
-                v_res = await verify(page, {}, snapshot, snapshot_after, snapshot_id=snapshot_after.get('snapshot_id'))
+                v_res = await verify(page, {}, snapshot_dict, snapshot_after, snapshot_id=snapshot_after.get('snapshot_id'))
                 v_res['health_assessment'] = health
                 
                 log_it(f"验证: {v_res['result']} - {v_res['reason']}")
                 
                 # 7. 记录到 Trace 及结束大步骤
                 recorder.record_sub_action(
-                    pre_snapshot=snapshot,
-                    decision_dict=decision,
+                    pre_snapshot=snapshot_dict,
+                    decision_dict=main_decision,
                     exec_status="success" if not exec_result.startswith("Error") else "failure",
                     exec_error=exec_result if exec_result.startswith("Error") else None,
                     duration_ms=duration_ms
@@ -375,4 +435,4 @@ if __name__ == "__main__":
     parser.add_argument("-i", "--interactive", action="store_true", help="开启交互式决策模式")
     
     args = parser.parse_args()
-    asyncio.run(run_exploration(args.url, args.steps, args.pre_steps, interactive=args.interactive))
+    asyncio.run(run_exploratory_test(args.url, args.steps, args.pre_steps, interactive=args.interactive))

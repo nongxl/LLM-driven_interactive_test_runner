@@ -16,12 +16,20 @@ class TraceEvaluator:
         penalty_per_step = 1.0 / total_steps
         
         for step in trace.steps:
-            actions_to_check = getattr(step, 'sub_actions', []) if getattr(step, 'sub_actions', []) else [step]
+            # 安全获取 sub_actions
+            sub_actions = getattr(step, 'sub_actions', [])
             step_has_failure = False
-            for sub in actions_to_check:
-                if sub.execution and sub.execution.status != "success":
+            
+            if not sub_actions:
+                # 如果没有子动作，且验证没通过，视为失败
+                if step.verification and step.verification.result != "pass":
                     step_has_failure = True
-                    break
+            else:
+                for sub in sub_actions:
+                    # 只有 SubAction 对象才有 execution 属性
+                    if hasattr(sub, 'execution') and sub.execution and sub.execution.status != "success":
+                        step_has_failure = True
+                        break
                     
             if step_has_failure:
                 score -= penalty_per_step

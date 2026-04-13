@@ -213,6 +213,11 @@ def menu_exploratory():
         pre_steps = select_file("artifacts/traces/raw", [".json"], "从录制库选择 JSON 前置轨迹")
     elif sub_choice == '4':
         pre_steps = "__MANUAL__"
+        print(f"\n{GREEN}{BOLD}💡 [提示] 您已进入手工预处理模式。{RESET}")
+        print(f"   1. 请在后续浏览器启动后手动完成登录/验证码等操作。")
+        print(f"   2. 完成后，请在控制台提示回复处输入: {YELLOW}{{\"task_status\": \"completed\"}}{RESET}")
+        print(f"   3. 系统将随后自动接管后续探索或测试任务。")
+        time.sleep(2)
 
     # [NEW] 询问是否开启交互决策模式 (如果 EXECUTION_MODE 已设置为 auto，则跳过)
     exec_mode = os.getenv("EXECUTION_MODE", "").lower()
@@ -256,6 +261,9 @@ def menu_scripted():
         pre_steps = select_file("artifacts/traces/raw", [".json"], "选择 JSON 前置轨迹")
     elif pre_choice == '4':
         pre_steps = "__MANUAL__"
+        print(f"\n{GREEN}{BOLD}💡 [提示] 手工模式注意事项：{RESET}")
+        print(f"   -> 浏览器启动后手动操作流程，完成后在控制台回复: {YELLOW}{{\"task_status\": \"completed\"}}{RESET}")
+        time.sleep(2)
     
     cmd = ["python", "runner/test_runner.py", spec]
     if pre_steps: cmd.extend(["--pre-steps", pre_steps])
@@ -325,6 +333,9 @@ def menu_batch():
             batch_pre_steps = select_file("artifacts/traces/raw", [".json"], "选择全局 JSON 前置")
         elif p_choice == '4':
             batch_pre_steps = "__MANUAL__"
+            print(f"\n{GREEN}{BOLD}💡 [提示] 批量模式全局手工预处理：{RESET}")
+            print(f"   -> 浏览器启动后手动操作，完成后在控制台回复: {YELLOW}{{\"task_status\": \"completed\"}}{RESET}")
+            time.sleep(2)
 
     print(f"\n{GREEN}即将批量运行 {len(files)} 个任务...{RESET}")
     time.sleep(1)
@@ -403,6 +414,9 @@ def menu_smoke():
         pre_steps = select_file("artifacts/traces/raw", [".json"], "从录制库选择 JSON 前置轨迹")
     elif sub_choice == '4':
         pre_steps = "__MANUAL__"
+        print(f"\n{GREEN}{BOLD}💡 [提示] 全局手工模式开始：{RESET}")
+        print(f"   -> 浏览器启动后手动操作，完成后在控制台回复: {YELLOW}{{\"task_status\": \"completed\"}}{RESET}")
+        time.sleep(2)
 
     strict = get_input("是否开启严格模式 (遇错即停)? (y/N)", "n")
     cmd = ["python", "ci/run_smoke_tests.py"]
