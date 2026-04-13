@@ -58,7 +58,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tracer.schema import Trace, TraceResult
 from core.action_executor import execute
-from core.snapshot_manager import get_snapshot
+from core.snapshot_manager import get_snapshot, clear_alerts_buffer, active_wait_and_monitor
 from core.verification_engine import initialize_verification_engine, get_playwright_page, verify, close_verification_engine
 from core.utils import cleanup_browser_env, resolve_trace_path, strip_ansi, S_OK, S_ERR, S_WARN, S_INFO
 from core.report_generator import ReportGenerator
@@ -234,6 +234,8 @@ async def run_replay(trace_file: str, strict: bool = False, step_timeout: int = 
             log_it(f"  [WARN] 初始状态采集失败: {e}")
 
         for step in trace.steps:
+            # [V3.3.2] 重置该步骤的异常 Buffer
+            clear_alerts_buffer()
             step_start = time.time()
             step_info = {"step_id": step.step_id, "instruction": step.instruction, "status": "pass", "error": None}
             log_it(f"[Step {step.step_id}] {step.instruction}")
@@ -372,9 +374,20 @@ async def run_replay(trace_file: str, strict: bool = False, step_timeout: int = 
                             await execute({"action": "wait_load", "value": "networkidle"})
                         except: pass
 
-                    if action_name == "goto": await asyncio.sleep(1.5)
-                    elif action_name == "click": await asyncio.sleep(1.0)
-                    else: await asyncio.sleep(0.5)
+                    # [v3.3] 业务异常感知与联动
+                    snapshot_after = await get_snapshot(logger=log_it)
+                    business_alert = snapshot_after.get('global_alerts', '')
+                    if business_alert and any(k in business_alert for k in ["失败", "错误", "异常", "无权限", "Error"]):
+                        log_it(f"  {S_ERR} 🚨 [回放捕捉到异常] {business_alert}")
+                        step_info["status"] = "fail"
+                        step_info["error"] = f"业务逻辑异常: {business_alert}"
+                        break # 跳出子动作循环
+
+                    # [V3.3.2] 主动监控式等待，随时捕捉 transient Toast
+                    page = await get_playwright_page()
+                    if action_name == "goto": await active_wait_and_monitor(1.5, page, logger=log_it)
+                    elif action_name == "click": await active_wait_and_monitor(1.0, page, logger=log_it)
+                    else: await active_wait_and_monitor(0.5, page, logger=log_it)
 
                 except Exception as e:
                     log_it(f"  {S_ERR} 错误: {e}")

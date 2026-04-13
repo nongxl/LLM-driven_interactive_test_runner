@@ -1,0 +1,7 @@
+name: Repro Deep Transient Toast
+url: file:///d:/workspace/LLM-driven_interactive_test_runner/repro_deep.html
+steps:
+  - instruction: Click the "Trigger Deep Error" button and verify the system catches the transient "数据库操作失败" message from both Iframe and Shadow DOM.
+    expected:
+      type: text_present
+      value: "数据库操作失败"

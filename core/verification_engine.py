@@ -5,10 +5,12 @@ import subprocess
 import time
 import sys
 import uuid
+import re
 from datetime import datetime
 from typing import Dict, Any, Optional, Union, List
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Page
 from core.utils import is_port_alive, get_agent_browser_executable
+from core.snapshot_manager import add_alert_to_buffer
 
 _pw_context_manager = None
 _pw_browser = None
@@ -178,10 +180,14 @@ async def initialize_verification_engine(logger=None):
                         logger(f"  [Warn] CDP 握手失败/超时 (4s)，准备重试...")
                         await asyncio.sleep(0.5)
 
-                # 为所有已存在的页面挂载弹窗处理器 (此时 _pw_browser 已经成立)
+                # [V3.3.6] 挂载全局网络层/原生弹窗监控 (支持 Context 级拦截以覆盖新页签)
                 for context in _pw_browser.contexts:
+                    # 为现有页签挂载处理器
                     for page in context.pages:
                         _setup_dialog_handler(page)
+                    
+                    # 挂载 Context 级网络审计 (自动覆盖后续创建的页签)
+                    await _setup_network_monitor_context(context, logger=logger)
 
             # [v1.9 修复4] 启动后台保活 Task（如已存在则不重复创建）
             if _keepalive_task is None or _keepalive_task.done():
@@ -218,6 +224,79 @@ def get_last_dialog_message():
     msg = _last_native_dialog
     _last_native_dialog = None # 读取后重置，防止同一弹窗被重复消费
     return msg
+
+
+async def _setup_network_monitor_context(context, logger=print):
+    """
+    [V3.3.6] 为 BrowserContext 挂载网络响应监听逻辑，实时捕捉业务级异常捕获。
+    相比 Page 级监听，Context 级能自动覆盖后续开启的所有新页签。
+    """
+    if hasattr(context, "_network_monitor_active"):
+        return
+        
+    context._network_monitor_active = True
+    
+    # 获取关键字配置
+    keywords_env = os.environ.get("ERROR_KEYWORDS", "数据库操作失败,网络异常,权限不足,系统繁忙,未知错误,Exception")
+    keywords = [k.strip() for k in keywords_env.split(",") if k.strip()]
+
+    async def handle_response(response):
+        try:
+            # 仅处理成功响应且 Content-Type 包含 json 的业务接口
+            header_ct = response.headers.get("content-type", "").lower()
+            if "json" in header_ct:
+                # 尝试获取 JSON Body (带超时保护防止由于长连接挂起)
+                try:
+                    body_json = await asyncio.wait_for(response.json(), timeout=2.0)
+                    
+                    # 1. 检查业务指标 (常见字段: success, ok, code, status)
+                    is_error = False
+                    error_msg = ""
+                    body_str = json.dumps(body_json, ensure_ascii=False)
+                    
+                    # 1. 检查业务指标 (常见字段: success, ok, code, status)
+                    is_error = False
+                    error_msg = ""
+                    
+                    if body_json.get("success") is False:
+                        is_error = True
+                        error_msg = body_json.get("message") or body_json.get("msg") or "Business logic failed (success=false)"
+                    elif body_json.get("ok") is False:
+                        is_error = True
+                    elif str(body_json.get("code", "200")) != "200" and str(body_json.get("code")) != "0":
+                        # 排除某些框架 code=0 为成功的逻辑
+                        is_error = True
+                        error_msg = body_json.get("message") or body_json.get("msg") or f"Error Code: {body_json.get('code')}"
+                    
+                    # 2. 关键字全量扫描
+                    if not is_error:
+                        for k in keywords:
+                            if k in body_str:
+                                is_error = True
+                                error_msg = f"Network Keyword Match [{k}] in response"
+                                break
+                    
+                    if is_error:
+                        full_alert = f"[Network Alert] {response.url} -> {error_msg}"
+                        if logger:
+                            # 强制使用 INFO 级别输出，确保用户可见
+                            logger(f"  [Monitor] 捕捉到网络层业务异常: {full_alert}")
+                        add_alert_to_buffer(full_alert)
+                        
+                except Exception:
+                    # 解析失败通常不是业务异常（如返回了非法 JSON）
+                    pass
+            elif response.status >= 400:
+                # 拦截 HTTP 4xx/5xx
+                alert_msg = f"[HTTP Alert] {response.url} -> Status {response.status}"
+                if logger:
+                    logger(f"  [Monitor] 捕捉到网络层 HTTP 异常: {alert_msg}")
+                add_alert_to_buffer(alert_msg)
+                
+        except Exception:
+            pass
+
+    context.on("response", lambda r: asyncio.create_task(handle_response(r)))
 
 
 async def get_playwright_page(target_url: Optional[str] = None, logger=None):
@@ -316,8 +395,11 @@ async def get_playwright_page(target_url: Optional[str] = None, logger=None):
                 if not _pw_page:
                     _pw_page = business_pages[-1]
 
-                # 确保 handler 已挂载
+                # 确保原生弹窗 handler 已挂载
                 _setup_dialog_handler(_pw_page)
+                
+                # [V3.3.6] 移除冗余的 Page 级网络审计挂载 (已由 Context 级全局监控接管)
+                # await _setup_network_monitor(_pw_page, logger=logger)
 
                 try:
                     if not _pw_browser.is_connected():
@@ -518,33 +600,65 @@ async def verify(page, expected: Union[Dict[str, Any], List[Dict[str, Any]], str
     return _result("rule", "dom", "fail", 1.0, last_actual, {})
 
 
+def should_skip_ai_verify(action: str, before_url: str, after_url: str, before_hash: str, after_hash: str) -> Optional[str]:
+    """
+    [Optimization] 预检逻辑：判断是否可以跳过昂贵的 AI 核对
+    返回: 如果可以跳过，返回跳过原因；否则返回 None
+    """
+    # 1. 辅助性动作，不涉及业务逻辑改变
+    silent_actions = ['wait', 'scroll', 'screenshot', 'hover', 'window_control', 'snapshot']
+    if action in silent_actions:
+        return f"辅助动作 ({action})，跳过语义核对"
+    
+    # 2. 状态完全一致（URL 且 Hash 均未变化）
+    # 除非是 assert 指令（用户明确要求核查），否则跳过
+    if action != 'assert' and before_url == after_url and before_hash == after_hash:
+        return "页面状态无实质性变化，视为静默操作"
+        
+    return None
+
 async def ai_verify(page, assertion: str, before_snapshot: Optional[Dict[str, Any]] = None, after_snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
-    [V4.2] 调用 LLM 进行语义化断言核实
+    [V4.3 Optimization] 调用 LLM 进行语义化断言核实
+    优化点：针对不同跳转情况裁减上下文
     """
     from ai.llm_client import query_llm
     
-    # 获取操作后的快照状态
-    after_aria = after_snapshot.get('aria_text', '') if after_snapshot else ""
+    # 获取变量
+    before_url = (before_snapshot or {}).get('url', '')
+    after_url = (after_snapshot or {}).get('url', '')
+    before_aria = (before_snapshot or {}).get('aria_text', '')
+    after_aria = (after_snapshot or {}).get('aria_text', '')
+    
+    # 自动获取当前状态（如果后置快照确实丢失）
     if not after_aria:
-        # 如果没有传入后置快照，实时抓取一个
         from core.snapshot_manager import get_snapshot
         new_snap = await get_snapshot()
         after_aria = new_snap.get('aria_text', '')
-        
-    before_aria = before_snapshot.get('aria_text', '') if before_snapshot else "未知(上一步可能未记录)"
+        after_url = new_snap.get('url', '')
+
+    # [Optimization Strategy] 上下文裁减
+    context_desc = ""
+    # 情况 A: URL 变化了 -> 新页面的存在即证明，无需对比前置页面
+    if after_url != before_url and after_url != "about:blank":
+        context_desc = f"▶ 注意: 页面已从 {before_url} 跳转至 {after_url}。\n\n--- 当前页面状态 (ARIA) ---\n{after_aria[:6000]}"
+    # 情况 B: URL 没变 -> 需要对比前后差异
+    else:
+        context_desc = (
+            f"--- 操作前页面状态 (ARIA) ---\n{before_aria[:2000]}\n\n"
+            f"--- 操作后页面状态 (ARIA) ---\n{after_aria[:4000]}"
+        )
 
     # 构造核实提示词
     messages = [
         {"role": "system", "content": (
             "▶ 你是一个 UI 自动化测试核实专家。\n"
-            "你的任务是根据操作前后的页面状态（ARIA Tree），判断用户的【预期断言】是否达成。\n"
+            "你的任务是根据操作前后的页面状态，判断用户的【预期断言】是否达成。\n"
             "你必须输出纯 JSON 格式：{\"result\": \"pass\" | \"fail\", \"reason\": \"简短的判定理由\"}"
         )},
         {"role": "user", "content": (
-            f"▶ 预期预期断言: {assertion}\n\n"
-            f"--- 操作前页面状态 (ARIA) ---\n{before_aria[:2000]}\n\n"
-            f"--- 操作后页面状态 (ARIA) ---\n{after_aria[:5000]}\n"
+            f"▶ 预期断言: {assertion}\n\n"
+            f"{context_desc}\n"
             "--------------------------------------------------\n"
             "请评估：操作后页面是否符合预期断言？如果是，返回 pass；否则返回 fail 并说明原因。"
         )}

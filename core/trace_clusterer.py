@@ -8,8 +8,20 @@ class TraceClusterer:
     Trace 聚类系统：用于将多条 Trace 自动去重并提取代表路径。
     """
     
-    def __init__(self, threshold: float = 0.7):
+    def __init__(self, threshold: float = 0.7, logger=None):
         self.threshold = threshold
+        self.logger = logger or print
+
+    def _log(self, msg, is_debug=True):
+        """内部受控日志辅助函数"""
+        msg_str = str(msg)
+        if is_debug:
+            # 只有开启 TEST_DEBUG 时才产出辅助调试信息
+            if os.environ.get("TEST_DEBUG") == "1":
+                self.logger(f"DEBUG: {msg_str}")
+        else:
+            # 非调试信息 (如核心进度) 始终产出
+            self.logger(msg_str)
 
     def normalize_trace(self, trace: Dict[str, Any]) -> List[str]:
         """
@@ -87,7 +99,7 @@ class TraceClusterer:
             if best_match and max_sim >= self.threshold:
                 best_match["traces"].append(trace)
                 t_id = (trace.get('metadata') or {}).get('trace_id', 'unknown')
-                print(f"DEBUG: Trace {t_id[:8]} -> Cluster {best_match['cluster_id']} (Sim: {max_sim:.2f})")
+                self._log(f"Trace {t_id[:8]} -> Cluster {best_match['cluster_id']} (Sim: {max_sim:.2f})", is_debug=True)
             else:
                 # 创建新 Cluster
                 new_id = f"cluster_{len(clusters) + 1}_{hashlib.md5(str(norm_seq).encode()).hexdigest()[:6]}"
@@ -96,7 +108,7 @@ class TraceClusterer:
                     "normalized_rep": norm_seq,
                     "traces": [trace]
                 })
-                print(f"DEBUG: Created new Cluster {new_id} for Trace {trace.get('metadata', {}).get('trace_id')[:8]}")
+                self._log(f"Created new Cluster {new_id} for Trace {trace.get('metadata', {}).get('trace_id')[:8]}", is_debug=True)
         
         # 提取 representative 并清理中间数据
         final_clusters = []
@@ -174,7 +186,7 @@ class TraceClusterer:
                 
             count += 1
             
-        print(f"✅ 已成功导出 {count} 条 Smoke Tests 至 {output_dir}/ (JSON/YAML)")
+        self._log(f"✅ 已成功导出 {count} 条 Smoke Tests 至 {output_dir}/ (JSON/YAML)", is_debug=False)
 
 
 if __name__ == "__main__":

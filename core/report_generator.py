@@ -99,7 +99,12 @@ class ReportGenerator:
             
             # 记录坏点 (Assert 失败)
             if v_result != 'pass':
-                findings.append(f"- 业务坏点: 在执行 '{s_instruction}' 时验证失败，原因: {v_reason}")
+                method_label = "业务拦截" if getattr(s_verif, 'method', '') == 'business_monitor' else "语义验证失败"
+                findings.append(f"- {method_label}: 在执行 '{s_instruction}' 时发现问题，原因: {v_reason}")
+
+        # [V3.3.12] 显式收集所有业务拦截告警作为高优先级上下文
+        business_alerts = [f for f in findings if "业务拦截" in f]
+        alert_context = "\n".join(business_alerts) if business_alerts else "未发现拦截告警"
 
         system_prompt = "你是一个专业的自动化测试分析师。请根据提供的测试步骤和验证结果，总结本次测试的‘测试要点’、‘执行结论’以及‘发现的问题’。使用中文，保持专业、精炼。"
         target_url = getattr(trace.metadata, 'url', 'unknown') or (trace.metadata.get('url') if isinstance(trace.metadata, dict) else 'unknown')
@@ -109,12 +114,15 @@ class ReportGenerator:
 执行轨迹记录:
 {chr(10).join(mission_steps)}
 
+🚨 重点关注：业务级拦截告警 (必须在下方的“关键发现”中显式列出)：
+{alert_context}
+
 请基于以上原始数据，生成一个排版精美的总结报告片断。包含以下部分：
 ### 📝 测试要点总结
 (总结本次测试覆盖了哪些业务功能点)
 
 ### 🔍 关键发现与坏点
-(如果没有发现问题，请说明‘未发现明显业务异常’；如果有，请详细列出)
+(如果没有发现问题，请说明‘未发现明显业务异常’；如果有业务拦截告警，请将其加粗并置于首位描述)
 
 ### 💡 结论建议
 (对系统健壮性的评价及后续建议)

@@ -35,7 +35,7 @@ class Expected(BaseModel):
     value: str
 
 class Verification(BaseModel):
-    method: Literal["rule", "ai", "rule+ai", "composite", "log_recovery"] = "rule"
+    method: Literal["rule", "ai", "rule+ai", "composite", "log_recovery", "business_monitor"] = "rule"
     source: Literal["dom", "snapshot", "various", "log"] = "dom"
     result: Literal["pass", "fail", "pending"] = "pending"
     confidence: float = Field(1.0, ge=0.0, le=1.0)

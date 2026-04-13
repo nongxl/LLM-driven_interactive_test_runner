@@ -3,6 +3,24 @@ import json
 import os
 import time
 import uuid
+import datetime
+
+# [V3.3.2] 异常持久化缓冲区，用于暂存步骤中段捕获的瞬时报错
+_ALERTS_BUFFER = []
+
+def clear_alerts_buffer():
+    global _ALERTS_BUFFER
+    _ALERTS_BUFFER = []
+
+def add_alert_to_buffer(msg: str):
+    """
+    [V3.3.5] 提供统一的异常上报接口，允许网络监控等外部模块写入异常
+    """
+    if not msg:
+        return
+    global _ALERTS_BUFFER
+    if msg not in _ALERTS_BUFFER:
+        _ALERTS_BUFFER.append(msg)
 
 # [v1.8 优化A] 增量扫描：追踪上次执行全谱业务异常扫描时的页面 URL
 _last_scanned_url: str = ""
@@ -41,6 +59,163 @@ def refine_aria_tree(aria_text: str) -> str:
         
     return "\n".join(refined)
 
+async def detect_business_errors(page, logger=None) -> str:
+    """
+    [V3.3] 深度业务异常探测引擎
+    针对 Toast、业务报错、数据库错误等进行全量 DOM 扫描
+    """
+    if not page: return ""
+    
+    # 获取环境变量中的关键字，若无则使用默认值
+    keywords_env = os.environ.get("ERROR_KEYWORDS", "数据库操作失败,网络异常,权限不足,系统繁忙,未知错误,Exception")
+    keywords = [k.strip() for k in keywords_env.split(",") if k.strip()]
+    
+    # 注入扫描脚本 (增强版：支持递归扫描 iframe 和 Shadow Root)
+    js_detect_script = """(keywords) => {
+        const results = [];
+        const seen = new Set();
+
+        function scanNode(doc) {
+            if (!doc || seen.has(doc)) return;
+            seen.add(doc);
+
+            // 1. 扫描常见的 Toast/Message 容器 (AntD, Element, etc.)
+            const toastSelectors = [
+                '.ant-message-notice', '.ant-notification-notice', 
+                '.el-message', '.el-notification', 
+                '.v-toast', '.toast', '.alert-danger', '.alert-error'
+            ];
+            
+            toastSelectors.forEach(s => {
+                try {
+                    doc.querySelectorAll(s).forEach(el => {
+                        if (el.innerText && (el.offsetParent !== null || el.getClientRects().length > 0)) {
+                            results.push(`[Toast/Alert] ${el.innerText.trim()}`);
+                        }
+                    });
+                } catch(e) {}
+            });
+
+            // 2. 关键字全量扫描
+            try {
+                const body = doc.body || doc;
+                const allText = (body.innerText || "") + " " + (body.textContent || "");
+                for (let k of keywords) {
+                    if (allText.includes(k)) {
+                        // 1. 优先寻找单一文本节点 (高精度匹配)
+                        const walker = doc.createTreeWalker(body, NodeFilter.SHOW_TEXT, null, false);
+                        let node;
+                        let foundInNode = false;
+                        while(node = walker.nextNode()) {
+                            if (node.textContent.includes(k)) {
+                                results.push(`[Keyword Match] ${k}: ${node.parentElement.innerText.substring(0, 100)}`);
+                                foundInNode = true;
+                                break; 
+                            }
+                        }
+
+                        // 2. [V3.3.6 增强] 分段文本回退匹配 (解决关键词被 <span> 拆分的问题)
+                        if (!foundInNode) {
+                            try {
+                                const findDeepestContainer = (root) => {
+                                    if (!root || !root.children) return null;
+                                    for (let child of root.children) {
+                                        if (child.innerText && child.innerText.includes(k)) {
+                                            const deeper = findDeepestContainer(child);
+                                            return deeper || child;
+                                        }
+                                    }
+                                    return null;
+                                };
+                                const container = findDeepestContainer(body);
+                                if (container) {
+                                    results.push(`[Fragmented Match] ${k}: ${container.innerText.substring(0, 100)}`);
+                                } else {
+                                    results.push(`[Fuzzy Match] ${k} detected in page text.`);
+                                }
+                            } catch(e) {}
+                        }
+                    }
+                }
+            } catch(e) {}
+
+            // 3. 递归扫描 iframe
+            try {
+                const iframes = doc.querySelectorAll('iframe, frame');
+                iframes.forEach(iframe => {
+                    try {
+                        scanNode(iframe.contentDocument || iframe.contentWindow.document);
+                    } catch(e) {
+                        // 跨域 iframe 无法扫描，忽略
+                    }
+                });
+            } catch(e) {}
+            
+            // 4. 尝试扫描 Shadow Roots (针对现代组件库)
+            // [V3.3.6 优化] 仅针对疑似包含组件的节点进行启发式扫描，降低全量 * 遍历压力
+            try {
+                const hosts = doc.querySelectorAll('*'); // 在 doc 范围内查找
+                for (let i = 0; i < hosts.length; i++) {
+                    const el = hosts[i];
+                    if (el.shadowRoot) {
+                        scanNode(el.shadowRoot);
+                    }
+                }
+            } catch(e) {}
+        }
+
+        scanNode(document);
+        return Array.from(new Set(results)).join(" | ");
+    }"""
+    
+    try:
+        # 增加 2s 超时执行，防止阻塞
+        found_errors = await asyncio.wait_for(page.evaluate(js_detect_script, keywords), timeout=2.0)
+        
+        if found_errors and logger:
+            # [V3.3.2] 这里不使用 log() 辅助器，因为它会被 is_debug 规则过滤
+            # 我们希望在开发/复现阶段，捕捉到异常时强制输出提示
+            logger(f"  [Found] 业务异常监测成功: {found_errors}")
+                
+        return found_errors if found_errors else ""
+    except Exception as e:
+        if os.environ.get("TEST_DEBUG") == "1" and logger:
+            logger(f"  [DEBUG] 业务异常探测评估失败: {e}")
+        return ""
+async def check_business_errors(page, logger=None):
+    """
+    [V3.3.2] 极轻量级扫描入口，供脉冲式监控使用
+    """
+    if not page: return ""
+    errs = await detect_business_errors(page, logger=logger)
+    if errs:
+        global _ALERTS_BUFFER
+        if errs not in _ALERTS_BUFFER:
+            _ALERTS_BUFFER.append(errs)
+    return errs
+
+async def active_wait_and_monitor(seconds, page, logger=None):
+    """
+    [V3.3.2] 主动监控式等待：在等待期间每隔 500ms 扫描一次业务异常
+    """
+    if not page:
+        await asyncio.sleep(seconds)
+        return
+    
+    start_time = time.time()
+    if logger:
+        logger(f"  [Wait] 主动监控已启动 (Duration: {seconds}s, Interval: 0.25s)")
+        
+    while time.time() - start_time < seconds:
+        # 执行轻量级扫描
+        errs = await check_business_errors(page, logger=logger)
+        if errs and logger:
+            # 同样使用强制输出，不走 log() 辅助器的过滤
+            logger(f"  [Monitor] 捕捉到脉冲异常: {errs}")
+            
+        # [V3.3.2 优化] 将脉冲频率提升至 250ms，确保捕捉 sub-second 的 Toast
+        await asyncio.sleep(0.25)
+
 async def get_snapshot(logger=None, target_url=None):
     """
     异步获取页面快照，确保 Ref ID 的全局唯一性与语义精简。
@@ -49,7 +224,7 @@ async def get_snapshot(logger=None, target_url=None):
     
     def log(msg):
         msg_str = str(msg)
-        is_debug = "DEBUG:" in msg_str.upper() or (msg_str.startswith(" [") and not msg_str.startswith(" [Wait]"))
+        is_debug = "DEBUG:" in msg_str.upper() or (msg_str.startswith(" [") and not any(k in msg_str for k in (" [Wait]", " [Alert]", " [Found]", " [Monitor]")))
         show_debug = os.environ.get("TEST_DEBUG") == "1"
         if is_debug and not show_debug: return
         
@@ -92,16 +267,34 @@ async def get_snapshot(logger=None, target_url=None):
                     await asyncio.sleep(1.5)
                 except: break
 
+            # [V3.3.2 Early-Detection] 在等待加载前先抢先扫描一轮，抓住立即出现的 Toast
+            early_business_errors = await detect_business_errors(page, logger=logger)
+            if early_business_errors:
+                _ALERTS_BUFFER.append(early_business_errors)
+
             # [Alert Logic] 同步获取对话框消息
             from core.verification_engine import get_last_dialog_message
-            global_alerts = get_last_dialog_message() or ""
+            native_alerts = get_last_dialog_message() or ""
+            
+            # [V3.3.2 Post-Scan] 加载完成后再扫一轮
+            late_business_errors = await detect_business_errors(page, logger=logger)
+            if late_business_errors:
+                _ALERTS_BUFFER.append(late_business_errors)
+            
+            # 合并缓冲区中的所有异常 (去重后拼接)
+            unique_alerts = list(dict.fromkeys(_ALERTS_BUFFER))
+            if native_alerts and f"Native: {native_alerts}" not in unique_alerts:
+                unique_alerts.insert(0, f"Native: {native_alerts}")
+            
+            global_alerts = " | ".join(unique_alerts)
+            
+            # 标记：一旦 snapshot 过程消耗了 Buffer，建议在 runner 层外部清理，或此处自动清理
+            # 我们选择在 Runner 的步骤开始时显示调用 clear_alerts_buffer
 
         # 2. 核心快照获取 (唯一真理来源: ActionExecutor)
-        log("正在通过 Agent Browser 引擎抓取实时快照...")
         raw_res_str = await execute_action({"action": "snapshot"})
         
         # 解析引擎输出
-        # 初始化默认结果
         res = {
             "aria_text": "Error: Snapshot failed",
             "url": current_page_url or "",
@@ -110,33 +303,32 @@ async def get_snapshot(logger=None, target_url=None):
         }
 
         try:
-            # 找到 JSON 部分
             json_start = raw_res_str.find("{")
             json_end = raw_res_str.rfind("}") + 1
             if json_start >= 0:
                 data = json.loads(raw_res_str[json_start:json_end])
                 
-                # 提取核心数据
                 raw_aria = data.get("data", {}).get("snapshot", "")
                 refined_aria = refine_aria_tree(raw_aria)
                 
-                # 优先级抓取 URL: Data > Page.url > current_page_url
                 detected_url = data.get("data", {}).get("url")
                 if not detected_url and page:
                     try: detected_url = page.url
                     except: pass
                 if not detected_url: detected_url = current_page_url or ""
 
-                # 注入业务异常信息
+                # 注入业务异常信息到 ARIA 树头部，确保所有 Runner 和 LLM 都能感知
                 if global_alerts:
-                    refined_aria = f"--- 页面业务异常探测 ---\nDetected Alerts: {global_alerts}\n--------------------------\n" + refined_aria
+                    log(f" [Alert] 捕捉到业务异常: {global_alerts}")
+                    refined_aria = f"--- [BUSINESS EXCEPTION DETECTED] ---\n{global_alerts}\n--------------------------\n" + refined_aria
                 
                 res["aria_text"] = refined_aria
                 res["url"] = detected_url
                 res["refs"] = data.get("data", {}).get("refs", {})
+                res["hash"] = data.get("data", {}).get("hash", str(uuid.uuid4())[:8])
                
                 node_count = refined_aria.count("[ref=")
-                log(f" [OK] 语义快照获取成功 (Nodes: {node_count}, URL: {res['url']})")
+                log(f" [OK] 快照获取成功 (Nodes: {node_count}, URL: {res['url']})")
             else:
                 log(f" [Error] 引擎输出未包含合法 JSON: {raw_res_str[:100]}...")
         except Exception as ee:

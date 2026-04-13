@@ -148,7 +148,7 @@ async def run_test(test_file, pre_steps_override=None):
         from ai.prompt_builder import get_system_guidance, init_step_messages, append_snapshot
         log_it(f"\n{get_system_guidance()}")
 
-        from core.snapshot_manager import get_snapshot
+        from core.snapshot_manager import get_snapshot, clear_alerts_buffer, active_wait_and_monitor
         from ai.llm_client import decide_action
         from core.action_executor import execute
         from core.verification_engine import verify, get_playwright_page, close_verification_engine, initialize_verification_engine
@@ -254,7 +254,12 @@ async def run_test(test_file, pre_steps_override=None):
                                 continue
                     except: pass
 
-                recorder.begin_step(instruction=instruction, expected_dict=expected)
+                # [V3.3.5] 支持语义化断言 (字符串) 记录
+                rec_expected = expected
+                if isinstance(expected, str):
+                    rec_expected = {"type": "semantic", "value": expected}
+                    
+                recorder.begin_step(instruction=instruction, expected_dict=rec_expected)
 
                 retry_count = 0
                 max_retries = 50
@@ -271,6 +276,8 @@ async def run_test(test_file, pre_steps_override=None):
                     # [v1.8 优化C] 移除 asyncio.sleep(2.0) 固定延迟
                     # 稳定性由 get_snapshot() 内部的 networkidle 智能等待承接
                     # 1. 获取前置快照 (增加静默心跳检测)
+                    # [V3.3.2] 重置该步骤及其重试循环的异常 Buffer
+                    clear_alerts_buffer()
                     try:
                         snapshot = await asyncio.wait_for(get_snapshot(logger=log_it), timeout=60.0)
                     except asyncio.TimeoutError:
@@ -382,7 +389,8 @@ async def run_test(test_file, pre_steps_override=None):
                     elif action_info in ("type", "scroll", "hover"):
                         cool_down = 1.0 # 非跳转类动作减少等待
 
-                    await asyncio.sleep(cool_down)
+                    # [V3.3.2] 使用主动监控式等待，随时捕捉 transient Toast
+                    await active_wait_and_monitor(cool_down, page, logger=log_it)
                     log_it(f"执行结果: {result}")
 
                     if is_auxiliary:
@@ -507,8 +515,20 @@ async def run_test(test_file, pre_steps_override=None):
                         # 获取后置快照用于记录和验证
                         snapshot_after = await get_snapshot(logger=log_it)
                         
-                        # 执行验证
-                        v_result = await verify(page, expected, snapshot, snapshot_after, snapshot_id=snapshot_after.get('snapshot_id'))
+                        # [v3.3] 业务异常一票否决制
+                        business_alert = snapshot_after.get('global_alerts', '')
+                        if business_alert and any(k in business_alert for k in ["失败", "错误", "异常", "不规范", "无权限", "Error"]):
+                            log_it(f"{S_ERR} 🚨 [发现业务异常] {business_alert}")
+                            v_result = {
+                                "method": "business_monitor",
+                                "result": "fail",
+                                "reason": f"捕捉到页面业务异常提示: {business_alert}",
+                                "confidence": 1.0
+                            }
+                        else:
+                            # 执行常规验证
+                            v_result = await verify(page, expected, snapshot, snapshot_after, snapshot_id=snapshot_after.get('snapshot_id'))
+                        
                         log_it(f"验证结果: {v_result['result']} ({v_result['method']}) - {v_result['reason']}")
                         
                         post_hash = snapshot_after.get('hash', f"hash_{len(snapshot_after.get('aria_text',''))}")

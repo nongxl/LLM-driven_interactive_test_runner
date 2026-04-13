@@ -1,0 +1,5 @@
+name: Repro Network Business Error
+url: file:///d:/workspace/LLM-driven_interactive_test_runner/repro_deep.html
+steps:
+  - instruction: Click the "Trigger Network Error (API)" button and verify the system catches the business failure from the network response.
+    expected: "页面应能捕捉到由于数据库操作失败引起的网络层异常"

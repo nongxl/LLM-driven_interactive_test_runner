@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Repro Toast</title>
+    <style>
+        #toast {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: #ff4d4f;
+            color: white;
+            padding: 10px 20px;
+            border-radius: 4px;
+            display: none;
+            z-index: 10000;
+        }
+    </style>
+</head>
+<body>
+    <h1>Toast Repro Page</h1>
+    <button id="trigger">Trigger Error</button>
+    <div id="toast">数据库操作失败</div>
+
+    <script>
+        document.getElementById('trigger').onclick = () => {
+            const toast = document.getElementById('toast');
+            toast.style.display = 'block';
+            console.log("Toast triggered");
+            setTimeout(() => {
+                toast.style.display = 'none';
+                console.log("Toast hidden");
+            }, 3000); // Increased to 3 seconds for easier capture
+        };
+    </script>
+</body>
+</html>

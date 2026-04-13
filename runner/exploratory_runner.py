@@ -53,8 +53,8 @@ load_dotenv()
 
 from core.exploration_engine import ExplorationEngine
 from core.state_memory import StateMemory
-from core.verification_engine import verify, get_playwright_page, close_verification_engine, initialize_verification_engine
-from core.snapshot_manager import get_snapshot
+from core.verification_engine import verify, get_playwright_page, close_verification_engine, initialize_verification_engine, should_skip_ai_verify
+from core.snapshot_manager import get_snapshot, clear_alerts_buffer, active_wait_and_monitor
 from core.action_executor import execute
 from tracer.recorder import TraceRecorder
 from tracer.evaluator import TraceEvaluator
@@ -242,6 +242,8 @@ async def run_exploratory_test(url, max_steps=30, pre_steps=None, interactive=Fa
 
     try:
         for step_idx in range(1, max_steps + 1):
+            # [V3.3.2] 重置该步骤的异常 Buffer
+            clear_alerts_buffer()
             log_it(f"\n--- 步骤 {step_idx} ---")
             
             decision = None
@@ -354,19 +356,59 @@ async def run_exploratory_test(url, max_steps=30, pre_steps=None, interactive=Fa
             page = await get_playwright_page()
             if page:
                 try:
-                    # 给页面一点点加载时间，确保网络空闲
-                    await page.wait_for_load_state("networkidle", timeout=2000)
+                    # [V3.3.2] 主动监控式等待，随时捕捉 transient Toast
+                    # 给页面 2.5s 的脉冲扫描时间
+                    await active_wait_and_monitor(2.5, page, logger=log_it)
                 except: pass
                 
                 snapshot_after = await get_snapshot(logger=log_it)
                 
                 # [V4.2] 提取决策中附带的自主断言 (Assertion)
                 assertion = main_decision.get('assertion')
-                log_it(f"🔍 正在核实语义断言: {assertion if assertion else '无语义断言'}")
                 
-                v_res = await verify(page, assertion, snapshot_dict, snapshot_after, snapshot_id=snapshot_after.get('snapshot_id'))
+                # [V4.3 Optimization] 增加跳过逻辑，节省 Token
+                skip_reason = None
+                action = main_decision.get('action', 'unknown')
+                assertion = main_decision.get('expected_assertion')
+                
+                # 同步检查是否有业务异常 (V3.3.12 提取与判定分离)
+                business_alert = snapshot_after.get('global_alerts', '')
+                is_business_fail = business_alert and any(k in business_alert for k in ["失败", "错误", "异常", "不规范", "无权限", "Error"])
+                
+                if not is_business_fail and assertion:
+                    skip_reason = should_skip_ai_verify(
+                        action,
+                        snapshot_dict.get('url', ''),
+                        snapshot_after.get('url', ''),
+                        snapshot_dict.get('hash', ''),
+                        snapshot_after.get('hash', '')
+                    )
+                
+                # [V3.3.12] 工业化验证分支逻辑：确保业务异常不被覆盖
+                if is_business_fail:
+                    v_res = {
+                        "method": "business_monitor",
+                        "source": "snapshot",
+                        "result": "fail",
+                        "confidence": 1.0,
+                        "reason": f"检测到业务异常: {business_alert}",
+                        "evidence": {"alerts": business_alert}
+                    }
+                elif skip_reason:
+                    log_it(f"⏭️ {skip_reason}")
+                    v_res = {
+                        "method": "rule_optimization",
+                        "source": "dom_match",
+                        "result": "pass",
+                        "confidence": 1.0,
+                        "reason": skip_reason,
+                        "evidence": {"action": action}
+                    }
+                else:
+                    log_it(f"🔍 正在核实语义断言: {assertion if assertion else '无语义断言'}")
+                    v_res = await verify(page, assertion, snapshot_dict, snapshot_after, snapshot_id=snapshot_after.get('snapshot_id'))
+                
                 v_res['health_assessment'] = health
-                
                 log_it(f"核实结果: {v_res['result']} - {v_res['reason']}")
                 
                 # 7. 记录到 Trace 及结束大步骤
@@ -387,8 +429,15 @@ async def run_exploratory_test(url, max_steps=30, pre_steps=None, interactive=Fa
         log_it(traceback.format_exc())
     finally:
         # 8. 完成并保存
+        # [V3.3.12] 智能判定最终状态：如果存在子步骤失败，整体标记为 fail
+        has_failed_step = any(
+            (getattr(s.verification, 'result', 'pass') == 'fail' if hasattr(s, 'verification') and s.verification else s.get('verification', {}).get('result', 'pass') == 'fail')
+            for s in recorder.trace.steps
+        )
+        final_status = "fail" if has_failed_step else "pass"
+        
         confidence = TraceEvaluator.calculate_confidence(recorder.trace)
-        recorder.finish(status="pass", confidence=confidence)
+        recorder.finish(status=final_status, confidence=confidence)
         saved_path = recorder.save(os.path.join("artifacts", "traces", "raw"))
         log_it(f"\n✅ 探索完成！Trace 已保存至: {saved_path}")
         log_it(f"📜 本次探索日志已保存至: {log_file_path}")
@@ -419,7 +468,7 @@ async def run_exploratory_test(url, max_steps=30, pre_steps=None, interactive=Fa
                             traces.append(trace_data)
             
             if traces:
-                clusterer = TraceClusterer(threshold=0.7)
+                clusterer = TraceClusterer(threshold=0.7, logger=log_it)
                 results = clusterer.cluster_traces(traces)
                 clusterer.export_smoke_tests(results, output_dir=output_dir)
                 log_it(f"✨ 聚类分析完成！{len(traces)} 条轨迹已提纯。资产已更新至: {output_dir}/")

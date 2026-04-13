@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Repro Deep Toast</title>
+</head>
+<body>
+    <h1>Deep Toast Repro Page</h1>
+    <button id="trigger">Trigger Deep Error (DOM)</button>
+    <button id="trigger-net">Trigger Network Error (API)</button>
+    
+    <div id="net-log" style="color: gray; font-size: 12px; margin-top: 10px;"></div>
+    <iframe id="sub-frame" srcdoc="
+        <html>
+        <body>
+            <div id='iframe-toast' style='display:none; background:red; color:white;'>数据库操作失败 (In Iframe)</div>
+            <script>
+                window.addEventListener('message', (e) => {
+                    if (e.data === 'show') {
+                        document.getElementById('iframe-toast').style.display = 'block';
+                        setTimeout(() => {
+                            document.getElementById('iframe-toast').style.display = 'none';
+                        }, 2000);
+                    }
+                });
+            </script>
+        </body>
+        </html>
+    " style="width: 300px; height: 100px; border: 1px solid #ccc;"></iframe>
+
+    <!-- Shadow DOM Container -->
+    <div id="shadow-host"></div>
+
+    <script>
+        // Setup Shadow DOM
+        const host = document.getElementById('shadow-host');
+        const root = host.attachShadow({mode: 'open'});
+        const shadowToast = document.createElement('div');
+        shadowToast.id = 'shadow-toast';
+        shadowToast.style.display = 'none';
+        shadowToast.style.background = 'darkred';
+        shadowToast.style.color = 'white';
+        shadowToast.textContent = '数据库操作失败 (In Shadow DOM)';
+        root.appendChild(shadowToast);
+
+        document.getElementById('trigger').onclick = () => {
+            console.log('Triggering deep errors...');
+            
+            // 1. Show in Iframe
+            const iframe = document.getElementById('sub-frame');
+            iframe.contentWindow.postMessage('show', '*');
+            
+            // 2. Show in Shadow DOM
+            shadowToast.style.display = 'block';
+            setTimeout(() => {
+                shadowToast.style.display = 'none';
+            }, 2000);
+        };
+
+        document.getElementById('trigger-net').onclick = async () => {
+            console.log('Triggering network error...');
+            document.getElementById('net-log').textContent = 'Fetching /api/save...';
+            
+            // 模拟业务接口返回失败
+            const mockResp = {
+                success: false,
+                message: "数据库操作失败: 字段 'creator_id' 不存在",
+                code: 500
+            };
+
+            // 使用 Blob 模拟真实的 Fetch 响应
+            const blob = new Blob([JSON.stringify(mockResp)], {type : 'application/json'});
+            const init = { "status" : 200 , "statusText" : "OK", "headers": {"Content-Type": "application/json"} };
+            const myResponse = new Response(blob, init);
+
+            // 劫持并触发监听
+            window.fetch = () => Promise.resolve(myResponse);
+            
+            await fetch('/api/save');
+            document.getElementById('net-log').textContent = 'API Returned success=false (Check console [Monitor] logs)';
+        };
+    </script>
+</body>
+</html>
