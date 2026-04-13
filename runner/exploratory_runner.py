@@ -349,19 +349,25 @@ async def run_exploratory_test(url, max_steps=30, pre_steps=None, interactive=Fa
             duration_ms = (time.time() - start_time) * 1000
             log_it(f"执行结果: {exec_result}")
 
-            # 6. 自动验证
-            log_it("🔍 正在验证操作效果...")
+            # 6. 自动验证与自主断言
+            log_it("🔍 正在核实操作效果...")
             page = await get_playwright_page()
             if page:
                 try:
+                    # 给页面一点点加载时间，确保网络空闲
                     await page.wait_for_load_state("networkidle", timeout=2000)
                 except: pass
                 
                 snapshot_after = await get_snapshot(logger=log_it)
-                v_res = await verify(page, {}, snapshot_dict, snapshot_after, snapshot_id=snapshot_after.get('snapshot_id'))
+                
+                # [V4.2] 提取决策中附带的自主断言 (Assertion)
+                assertion = main_decision.get('assertion')
+                log_it(f"🔍 正在核实语义断言: {assertion if assertion else '无语义断言'}")
+                
+                v_res = await verify(page, assertion, snapshot_dict, snapshot_after, snapshot_id=snapshot_after.get('snapshot_id'))
                 v_res['health_assessment'] = health
                 
-                log_it(f"验证: {v_res['result']} - {v_res['reason']}")
+                log_it(f"核实结果: {v_res['result']} - {v_res['reason']}")
                 
                 # 7. 记录到 Trace 及结束大步骤
                 recorder.record_sub_action(

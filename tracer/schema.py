@@ -20,6 +20,7 @@ class Decision(BaseModel):
     action: Union[Literal["click", "type", "select", "wait", "navigate", "scroll", "keyboard", "get_text", "screenshot", "assert", "tab", "switch_tab", "wait_load", "goto", "open", "fill", "snapshot"], str]
     target: Optional[Target] = None
     value: Optional[Union[str, int, float]] = None
+    assertion: Optional[str] = Field(None, description="The semantic expectation for this action") # [V4.2] 自主断言支持
     reasoning: str = Field(..., description="LLM decision explanation")
     raw_action: Optional[Dict[str, Any]] = Field(None, description="The raw action JSON from AI / input")
     task_status: Literal["in_progress", "completed"] = "completed"

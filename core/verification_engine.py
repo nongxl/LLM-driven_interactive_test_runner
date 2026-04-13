@@ -412,10 +412,17 @@ async def _save_verification_debug(page, expected, actual_text, processed_full_t
         print(f"  [Warn] 保存调试现场失败: {e}", flush=True)
 
 
-async def verify(page, expected: Union[Dict[str, Any], List[Dict[str, Any]], None], before_snapshot: Optional[Dict[str, Any]] = None, after_snapshot: Optional[Dict[str, Any]] = None, snapshot_id: Optional[str] = None) -> Dict[str, Any]:
-    """统一验证接口"""
+async def verify(page, expected: Union[Dict[str, Any], List[Dict[str, Any]], str, None], before_snapshot: Optional[Dict[str, Any]] = None, after_snapshot: Optional[Dict[str, Any]] = None, snapshot_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    统一验证接口
+    [V4.2] 支持直接传入字符串形式的自主断言 (Assertion)
+    """
     if not expected:
         return _result("rule", "dom", "pass", 1.0, "未提供预期条件，默认通过", {})
+
+    # [V4.2] 处理自主语义断言 (String)
+    if isinstance(expected, str):
+        return await ai_verify(page, expected, before_snapshot, after_snapshot)
 
     if isinstance(expected, list):
         results = []
@@ -510,6 +517,51 @@ async def verify(page, expected: Union[Dict[str, Any], List[Dict[str, Any]], Non
 
     return _result("rule", "dom", "fail", 1.0, last_actual, {})
 
+
+async def ai_verify(page, assertion: str, before_snapshot: Optional[Dict[str, Any]] = None, after_snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    [V4.2] 调用 LLM 进行语义化断言核实
+    """
+    from ai.llm_client import query_llm
+    
+    # 获取操作后的快照状态
+    after_aria = after_snapshot.get('aria_text', '') if after_snapshot else ""
+    if not after_aria:
+        # 如果没有传入后置快照，实时抓取一个
+        from core.snapshot_manager import get_snapshot
+        new_snap = await get_snapshot()
+        after_aria = new_snap.get('aria_text', '')
+        
+    before_aria = before_snapshot.get('aria_text', '') if before_snapshot else "未知(上一步可能未记录)"
+
+    # 构造核实提示词
+    messages = [
+        {"role": "system", "content": (
+            "▶ 你是一个 UI 自动化测试核实专家。\n"
+            "你的任务是根据操作前后的页面状态（ARIA Tree），判断用户的【预期断言】是否达成。\n"
+            "你必须输出纯 JSON 格式：{\"result\": \"pass\" | \"fail\", \"reason\": \"简短的判定理由\"}"
+        )},
+        {"role": "user", "content": (
+            f"▶ 预期预期断言: {assertion}\n\n"
+            f"--- 操作前页面状态 (ARIA) ---\n{before_aria[:2000]}\n\n"
+            f"--- 操作后页面状态 (ARIA) ---\n{after_aria[:5000]}\n"
+            "--------------------------------------------------\n"
+            "请评估：操作后页面是否符合预期断言？如果是，返回 pass；否则返回 fail 并说明原因。"
+        )}
+    ]
+    
+    try:
+        response_text = await asyncio.to_thread(query_llm, messages, json_mode=True)
+        if "```json" in response_text:
+            response_text = response_text.split("```json")[1].split("```")[0].strip()
+        
+        res_data = json.loads(response_text)
+        result = res_data.get('result', 'fail').lower()
+        reason = res_data.get('reason', 'AI 未给出明确理由')
+        
+        return _result("ai", "snapshot", result, 0.9, reason, {"assertion": assertion})
+    except Exception as e:
+        return _result("ai", "snapshot", "fail", 0.0, f"AI 验证过程出错: {e}", {"assertion": assertion})
 
 def get_last_active_url():
     """获取最后一次快照探测到的活跃页签 URL"""

@@ -99,6 +99,39 @@ def print_header(subtitle=None):
         print("="*60)
         print(f"{RESET}")
 
+# --- URL 历史记录持久化 ---
+URL_HISTORY_FILE = os.path.join("artifacts", "url_history.txt")
+
+def load_url_history():
+    """读取最近 10 条 URL 历史"""
+    if not os.path.exists(URL_HISTORY_FILE):
+        return []
+    try:
+        with open(URL_HISTORY_FILE, "r", encoding="utf-8") as f:
+            lines = [line.strip() for line in f.readlines() if line.strip()]
+            return lines[:10]
+    except:
+        return []
+
+def save_url_history(url):
+    """保存 URL 并去重"""
+    if not url or "://" not in url: return
+    history = load_url_history()
+    # 去重：如果存在则先移除
+    if url in history:
+        history.remove(url)
+    # 插入到头部
+    history.insert(0, url)
+    # 限制 10 条
+    history = history[:10]
+    
+    os.makedirs(os.path.dirname(URL_HISTORY_FILE), exist_ok=True)
+    try:
+        with open(URL_HISTORY_FILE, "w", encoding="utf-8") as f:
+            f.write("\n".join(history))
+    except:
+        pass
+
 def get_input(prompt, default=None):
     if default:
         res = input(f"{YELLOW}{prompt} (默认: {default}): {RESET}").strip()
@@ -191,8 +224,36 @@ def run_command(cmd_list, wait_at_end=True):
 
 def menu_exploratory():
     print_header("1. 探索性测试 (Exploratory Test)")
-    url = get_input("请输入被测网址 (URL)")
-    if not url: return
+    
+    # [V4.3] 加载并展示 URL 历史
+    history = load_url_history()
+    if history:
+        print(f"{YELLOW}历史记录 (最近 10 条):{RESET}")
+        for i, h_url in enumerate(history, 1):
+            print(f"  {BLUE}[{i}]{RESET} {h_url}")
+        print()
+        
+    prompt = "请输入被测网址 (URL)"
+    if history:
+        prompt += f" 或 编号 (1-{len(history)})"
+    
+    raw_input = get_input(prompt)
+    if not raw_input: return
+    
+    url = raw_input
+    # 判断是否是编号选择
+    if raw_input.isdigit():
+        idx = int(raw_input)
+        if 1 <= idx <= len(history):
+            url = history[idx - 1]
+            print(f"{GREEN}已选择历史 URL: {BOLD}{url}{RESET}")
+        else:
+            print(f"{RED}❌ 无效编号，请重新输入。{RESET}")
+            time.sleep(1)
+            return menu_exploratory()
+    
+    # 记录到历史
+    save_url_history(url)
     
     steps = get_input("探索步数 (Max Steps)", "30")
     
